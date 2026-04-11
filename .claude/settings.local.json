@@ -7,7 +7,9 @@
       "Bash(python3:*)",
       "Bash(ls:*)",
       "Bash(cat *.md)",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(git commit -m ':*)",
+      "Bash(git commit:*)"
     ]
   }
 }
