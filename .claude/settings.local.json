@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pdftotext \"/Users/admin/workspace/ocvault/raw/佛山市南海区大沥投资发展有限公司 2026 年面向专业投资者非公开发行公司债券（第一期）募集说明书.pdf\" -)",
+      "Bash(python3 -c \"import fitz; print\\('pymupdf available'\\)\")",
+      "Bash(python3 -c \"import PyPDF2; print\\('pypdf2 available'\\)\")",
+      "Bash(python3:*)",
+      "Bash(ls:*)",
+      "Bash(cat *.md)",
+      "Bash(git add:*)"
+    ]
+  }
+}
