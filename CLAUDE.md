@@ -14,9 +14,8 @@ ocvault/
 │   ├── 01-发行条款/       # 债券发行条款
 │   ├── 02-募集资金运用/   # 资金用途
 │   ├── 03-发行人基本情况/ # 发行人概况
-│   ├── 04-主营业务分析/   # 主营业务
-│   └── 05-资产状况/       # 财务分析（待生成）
-└── scripts/               # Python 脚本
+│   └── 05-资产状况/       # 财务分析
+└── scripts/               # Python 脚本（3 个）
 ```
 
 **命名约定**: `{发行人全称}-{内容类型}.md`
@@ -25,9 +24,8 @@ ocvault/
 
 | 脚本 | 功能 |
 |------|------|
-| `extract_prospectus.py` | 提取 PDF 文本，生成 01-04 目录笔记 |
-| `extract_tables_camelot.py` | 提取 PDF 表格，追加到 05-资产状况 |
-| `create_business_notes.py` | 生成主营业务分析笔记 |
+| `extract_prospectus.py` | 提取 PDF 文本，生成 01-03 目录笔记 |
+| `extract_tables_camelot.py` | 提取 PDF 表格，生成 05-资产状况 |
 | `tushare_data_sync.py` | 同步 Tushare 宏观/债券数据 |
 
 ## 使用方法
@@ -37,7 +35,6 @@ ocvault/
 cp new_prospectus.pdf raw/
 python3 scripts/extract_prospectus.py
 python3 scripts/extract_tables_camelot.py
-python3 scripts/create_business_notes.py
 
 # 同步外部数据
 export TUSHARE_TOKEN=your_token
@@ -62,8 +59,7 @@ export TUSHARE_TOKEN=your_token
 | 01-发行条款 | `{发行人}-发行条款.md` | 规模、期限、利率、增信、评级 |
 | 02-募集资金运用 | `{发行人}-募集资金运用.md` | 资金用途、偿债计划 |
 | 03-发行人基本情况 | `{发行人}-概况.md` | 注册资本、法人、股权 |
-| 04-主营业务分析 | `{发行人}-主营业务.md` | 业务板块、收入、毛利率 |
-| 05-资产状况 | `{发行人}-财务分析.md` | 财务数据、偿债指标 |
+| 05-资产状况 | `{发行人}-财务分析.md` | 财务数据、偿债指标、原始表格 |
 
 ## 注意事项
 

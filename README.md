@@ -4,8 +4,8 @@
 
 ## 项目现状
 
-- **已处理发行人**: 6 家（樟树创业投资、泾县泾城实业、湖南花垣十八洞、湖州南浔强村富民、山东阳都智圣、佛山南海大沥）
-- **知识库文件**: 26 个 Markdown 笔记
+- **已处理发行人**: 6 家
+- **知识库文件**: 20 个 Markdown 笔记（01-03 目录）
 - **债券类型**: 公司债、乡村振兴债、革命老区债
 
 ## 目录结构
@@ -18,8 +18,8 @@ ocvault/
 │   ├── 01-发行条款/       # 债券发行条款
 │   ├── 02-募集资金运用/   # 资金用途
 │   ├── 03-发行人基本情况/ # 发行人概况
-│   └── 04-主营业务分析/   # 主营业务
-└── scripts/               # Python 处理脚本
+│   └── 05-资产状况/       # 财务分析（由 extract_tables_camelot.py 生成）
+└── scripts/               # Python 处理脚本（3 个）
 ```
 
 ## 使用说明
@@ -30,14 +30,11 @@ ocvault/
 # 1. 将 PDF 放入 raw/ 目录
 cp new_prospectus.pdf raw/
 
-# 2. 提取文本生成笔记 (01-04 目录)
+# 2. 提取文本生成笔记 (01-03 目录)
 python3 scripts/extract_prospectus.py
 
-# 3. 提取表格数据 (追加到 05-资产状况)
+# 3. 提取表格数据 (05-资产状况)
 python3 scripts/extract_tables_camelot.py
-
-# 4. 生成主营业务分析 (04-主营业务分析)
-python3 scripts/create_business_notes.py
 ```
 
 ### 同步外部数据
@@ -51,9 +48,8 @@ python3 scripts/tushare_data_sync.py
 
 | 脚本 | 功能 |
 |------|------|
-| `extract_prospectus.py` | 从 PDF 提取文本，生成 01-04 目录笔记 |
-| `extract_tables_camelot.py` | 提取 PDF 表格，追加到 05-资产状况 |
-| `create_business_notes.py` | 生成主营业务分析笔记 |
+| `extract_prospectus.py` | 从 PDF 提取文本，生成 01-03 目录笔记 |
+| `extract_tables_camelot.py` | 提取 PDF 表格，生成 05-资产状况 |
 | `tushare_data_sync.py` | 同步宏观经济和债券市场数据 |
 
 ## 环境配置
