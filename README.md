@@ -18,9 +18,8 @@ ocvault/
 │   ├── 01-发行条款/       # 债券发行条款
 │   ├── 02-募集资金运用/   # 资金用途
 │   ├── 03-发行人基本情况/ # 发行人概况
-│   ├── 04-主营业务分析/   # 主营业务（6 个发行人模板）
-│   └── 05-资产状况/       # 财务分析（由 extract_tables_camelot.py 生成）
-└── scripts/               # Python 处理脚本（3 个）
+│   └── 04-主营业务分析/   # 主营业务（6 个发行人模板）
+└── scripts/               # Python 处理脚本（2 个）
 ```
 
 ## 使用说明
@@ -31,34 +30,22 @@ ocvault/
 # 1. 将 PDF 放入 raw/ 目录
 cp new_prospectus.pdf raw/
 
-# 2. 提取文本生成笔记 (01-03 目录)
+# 2. 提取文本生成笔记 (01-04 目录)
 python3 scripts/extract_prospectus.py
-
-# 3. 提取表格数据 (05-资产状况)
-python3 scripts/extract_tables_camelot.py
-```
-
-### 同步外部数据
-
-```bash
-export TUSHARE_TOKEN=your_token
-python3 scripts/tushare_data_sync.py
 ```
 
 ## 核心脚本
 
 | 脚本 | 功能 |
 |------|------|
-| `extract_prospectus.py` | 从 PDF 提取文本，生成 01-03 目录笔记 |
-| `extract_tables_camelot.py` | 提取 PDF 表格，生成 05-资产状况 |
-| `tushare_data_sync.py` | 同步宏观经济和债券市场数据 |
+| `extract_prospectus.py` | 从 PDF 提取文本，生成 01-04 目录笔记 |
 
 ## 环境配置
 
 ### Python 依赖
 
 ```bash
-pip install PyMuPDF camelot-py pandas tushare
+pip install PyMuPDF
 ```
 
 ### Obsidian 插件
