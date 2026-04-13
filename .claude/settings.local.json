@@ -9,7 +9,29 @@
       "Bash(cat *.md)",
       "Bash(git add:*)",
       "Bash(git commit -m ':*)",
-      "Bash(git commit:*)"
+      "Bash(git commit:*)",
+      "WebFetch(domain:tushare.pro)",
+      "Bash(head -50 *.md)",
+      "Bash(wc -l \"/Users/admin/workspace/ocvault/knowledge/01-发行条款\"/*.md)",
+      "Bash(xxd)",
+      "Bash(xargs -I {} cat \"knowledge/02-募集资金运用/{}\")",
+      "Bash(xargs -I {} cat \"knowledge/03-发行人基本情况/{}\")",
+      "Bash(xargs -I {} cat \"knowledge/04-财务状况/{}\")",
+      "Bash(pip --version)",
+      "Bash(pip3:*)",
+      "Bash(gs --version)",
+      "Bash(tar:*)",
+      "Bash(./configure --prefix=/usr/local)",
+      "Bash(sudo make:*)",
+      "Bash(make install:*)",
+      "Bash(export PATH=\"$HOME/.local/bin:$PATH\")",
+      "Bash(pip list:*)",
+      "Bash(find:*)",
+      "Bash(grep:*)",
+      "Bash(wc -l knowledge/05-财务状况/*.md)",
+      "Bash(wc -l /Users/admin/workspace/ocvault/knowledge/05-财务状况/*.md)",
+      "Bash(wc:*)",
+      "Bash(gh repo:*)"
     ]
   }
 }
