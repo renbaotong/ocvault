@@ -2,22 +2,24 @@
 
 固定收益投行业务的公司债募集说明书结构化知识库，使用 Obsidian 进行管理。
 
+## 项目现状
+
+- **已处理发行人**: 6 家（樟树创业投资、泾县泾城实业、湖南花垣十八洞、湖州南浔强村富民、山东阳都智圣、佛山南海大沥）
+- **知识库文件**: 26 个 Markdown 笔记
+- **债券类型**: 公司债、乡村振兴债、革命老区债
+
 ## 目录结构
 
 ```
 ocvault/
-├── raw/                    # 原始 PDF 文件
+├── raw/                    # 原始 PDF 文件（6 份募集说明书）
 ├── knowledge/              # 知识库文件
-│   ├── 00-Meta/           # 元数据、索引
-│   ├── 01-发行条款/       # 第二节信息
-│   ├── 02-募集资金运用/   # 第三节信息
-│   ├── 03-发行人基本情况/ # 第四节信息
-│   ├── 04-主营业务分析/   # 主营业务
-│   ├── 05-财务状况/       # 第五节信息
-│   ├── 06-区域分析/       # 地方财政、区域经济
-│   └── 07-模板参考/       # 写作参考模板
-│   └── scripts/           # 处理脚本
-└── scripts/               # 工具脚本
+│   ├── 00-Meta/           # 索引（发行人索引、债券索引）
+│   ├── 01-发行条款/       # 债券发行条款
+│   ├── 02-募集资金运用/   # 资金用途
+│   ├── 03-发行人基本情况/ # 发行人概况
+│   └── 04-主营业务分析/   # 主营业务
+└── scripts/               # Python 处理脚本
 ```
 
 ## 使用说明
@@ -25,24 +27,55 @@ ocvault/
 ### 处理新募集说明书
 
 ```bash
-python scripts/process_prospectus.py <pdf_path>
+# 1. 将 PDF 放入 raw/ 目录
+cp new_prospectus.pdf raw/
+
+# 2. 提取文本生成笔记 (01-04 目录)
+python3 scripts/extract_prospectus.py
+
+# 3. 提取表格数据 (追加到 05-资产状况)
+python3 scripts/extract_tables_camelot.py
+
+# 4. 生成主营业务分析 (04-主营业务分析)
+python3 scripts/create_business_notes.py
 ```
 
-### 知识库更新
+### 同步外部数据
 
-1. 将新 PDF 放入 `raw/` 目录
-2. 运行处理脚本生成笔记
-3. 在 Obsidian 中复核和补充
+```bash
+export TUSHARE_TOKEN=your_token
+python3 scripts/tushare_data_sync.py
+```
+
+## 核心脚本
+
+| 脚本 | 功能 |
+|------|------|
+| `extract_prospectus.py` | 从 PDF 提取文本，生成 01-04 目录笔记 |
+| `extract_tables_camelot.py` | 提取 PDF 表格，追加到 05-资产状况 |
+| `create_business_notes.py` | 生成主营业务分析笔记 |
+| `tushare_data_sync.py` | 同步宏观经济和债券市场数据 |
+
+## 环境配置
+
+### Python 依赖
+
+```bash
+pip install PyMuPDF camelot-py pandas tushare
+```
+
+### Obsidian 插件
+
+- **Dataview** - 结构化数据查询（索引页面使用）
+- **Templater** - 笔记模板
 
 ## 标签体系
 
 - `#债券类型`: `#公司债` `#乡村振兴债` `#革命老区债`
-- `#发行状态**: `#已发行` `#注册中`
 - `#增信方式`: `#保证担保` `#抵押担保` `#质押担保` `#信用`
 - `#行政层级`: `#省级` `#地市级` `#区县级`
 
-## 工具要求
+## 注意事项
 
-- Python 3.8+
-- PyMuPDF (fitz)
-- Obsidian (推荐安装 Dataview、Templates 插件)
+1. **PDF 格式**: 必须是文本可选格式（非扫描图片）
+2. **数据校验**: 提取的财务数字需人工校验
