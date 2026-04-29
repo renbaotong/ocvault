@@ -25,3 +25,9 @@ venv/
 # Temporary files
 tmp/
 temp/
+
+# Raw PDF sources (large files, keep local only)
+raw/
+
+# Claude Code
+.claude/
