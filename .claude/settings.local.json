@@ -19,7 +19,23 @@
       "Bash(gs:*)",
       "Bash(tar:*)",
       "Bash(shasum:*)",
-      "WebFetch(domain:tushare.pro)"
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "Bash(/c/Users/baotong/AppData/Local/Python/bin/python.exe *)",
+      "Bash(python -c ' *)",
+      "Bash(pip install *)",
+      "Bash(python *)",
+      "Bash(python scripts/extract_business_analysis.py)",
+      "Bash(echo \"Done: exit code $?\")",
+      "Bash(echo \"Exit: $?\")",
+      "Bash(tee /tmp/batch_output.txt)",
+      "Bash(PYTHONIOENCODING=utf-8 python -u scripts/generate_meta_index.py)",
+      "Bash(PYTHONIOENCODING=utf-8 python -u scripts/extract_bond_terms.py)",
+      "Bash(PYTHONIOENCODING=utf-8 python -u scripts/extract_fund_usage.py)",
+      "Bash(PYTHONIOENCODING=utf-8 python -u scripts/extract_issuer_profile.py)",
+      "Bash(PYTHONIOENCODING=utf-8 python -u scripts/extract_business_analysis.py)",
+      "Bash(PYTHONIOENCODING=utf-8 python -u scripts/extract_financial_analysis.py)",
+      "Bash(PYTHONIOENCODING=utf-8 python scripts/generate_meta_index.py)"
     ]
   }
 }
