@@ -177,6 +177,7 @@ class FinancialAnalysisExtractor(BaseExtractor):
             print(f"  找到资产结构分析相关内容第 {[p+1 for p in asset_structure_pages]} 页")
 
             # 策略1：优先扫描所有页面查找"项目"+年份的表格头结构（最可靠）
+            # 关键：只找包含"金额"+"占比"列头的页面，排除资产负债表（只有金额列）
             target_pages = []
             best_header_page = -1
             best_header_score = 0
@@ -189,8 +190,9 @@ class FinancialAnalysisExtractor(BaseExtractor):
                     if line in ["项目", "项目名称"] and i + 1 < len(lines):
                         next_lines = ' '.join(lines[i+1:i+8])
                         # 必须有至少3个年份日期（资产结构表是3期对比）
+                        # 或者至少2个（部分PDF只有2期）
                         year_matches = re.findall(r'202\d', next_lines)
-                        if len(set(year_matches)) < 3:
+                        if len(set(year_matches)) < 2:
                             break
                         if not re.search(r'202\d.*[年月]', next_lines):
                             break
@@ -216,13 +218,22 @@ class FinancialAnalysisExtractor(BaseExtractor):
                         if not has_numbers:
                             break
 
-                        # 检查是否有"金额"+"占比"列头（资产结构表特有，资产负债表没有）
+                        # 关键检查：必须有"金额"+"占比"列头（资产结构表特有，资产负债表没有）
+                        # 在"项目"行之后搜索列头
                         has_amount_ratio_header = False
                         for j in range(i+1, min(i+12, len(lines))):
                             l = lines[j]
                             if l in ["金额", "占比"]:
                                 has_amount_ratio_header = True
                                 break
+                        # 也检查"项目"和年份之间是否有占比
+                        if not has_amount_ratio_header:
+                            header_section = ' '.join(lines[i:i+10])
+                            if '占比' in header_section:
+                                has_amount_ratio_header = True
+
+                        if not has_amount_ratio_header:
+                            break  # 这是资产负债表，跳过
 
                         # 评分
                         score = len(unique_items) * 3
@@ -484,8 +495,8 @@ class FinancialAnalysisExtractor(BaseExtractor):
                 i += 1
                 continue
 
-            # 数字行保持独立
-            if re.match(r'^-?[\d,]+\.?\d*$', line):
+            # 数字行（包括带%的百分比）保持独立
+            if re.match(r'^-?[\d,]+\.?\d*%?$', line):
                 merged.append(line)
                 i += 1
                 continue
@@ -503,7 +514,7 @@ class FinancialAnalysisExtractor(BaseExtractor):
                 next_line = lines[j].strip()
                 if not next_line:
                     break
-                if re.match(r'^-?[\d,]+\.?\d*$', next_line):
+                if re.match(r'^-?[\d,]+\.?\d*%?$', next_line):
                     break
                 if next_line in known_words:
                     break
@@ -601,9 +612,11 @@ class FinancialAnalysisExtractor(BaseExtractor):
     def _extract_years(self, lines: List[str]) -> List[str]:
         years = []
         combined_text = ' '.join(lines[:100])
+        # 支持多种日期格式：2024年12月31日、2024年末、2024/12/31、2024年9月末
         for pattern in [r"(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日",
                         r"(\d{4})\s*年\s*(\d{1,2})\s*月末",
-                        r"(\d{4})\s*年末"]:
+                        r"(\d{4})\s*年末",
+                        r"(\d{4})/(\d{1,2})/(\d{1,2})"]:
             matches = re.findall(pattern, combined_text)
             if matches:
                 for m in matches:
@@ -636,42 +649,43 @@ class FinancialAnalysisExtractor(BaseExtractor):
     def _parse_values(self, all_numbers: List[str], num_years: int) -> List[Dict[str, str]]:
         values = []
         required_numbers = num_years * 2
-        if len(all_numbers) < required_numbers:
-            for i in range(min(num_years, len(all_numbers))):
+
+        # If we have exactly the right number of values, use alternating (amount, ratio) pairs
+        if len(all_numbers) == required_numbers:
+            for i in range(0, required_numbers, 2):
+                values.append({"amount": all_numbers[i], "ratio": all_numbers[i + 1]})
+            return values[:num_years]
+
+        # If we have more than required, try to detect column vs alternating layout
+        if len(all_numbers) > required_numbers:
+            try:
+                first_six = [float(all_numbers[i]) for i in range(min(6, len(all_numbers)))]
+                if len(first_six) == 6:
+                    is_column = (
+                        all(x > 10 for x in first_six[:3]) and
+                        all(x <= 100 for x in first_six[3:6])
+                    )
+                    is_alternate = (
+                        all(first_six[i] > 10 for i in [0, 2, 4]) and
+                        all(first_six[i] <= 100 for i in [1, 3, 5])
+                    )
+                    if is_column:
+                        for i in range(num_years):
+                            values.append({"amount": all_numbers[i], "ratio": all_numbers[i + num_years]})
+                        return values[:num_years]
+                    elif is_alternate:
+                        for i in range(0, required_numbers, 2):
+                            values.append({"amount": all_numbers[i], "ratio": all_numbers[i + 1]})
+                        return values[:num_years]
+            except ValueError:
+                pass
+
+        # Fallback: pair alternately from available numbers
+        for i in range(0, min(required_numbers, len(all_numbers)), 2):
+            if i + 1 < len(all_numbers):
+                values.append({"amount": all_numbers[i], "ratio": all_numbers[i + 1]})
+            else:
                 values.append({"amount": all_numbers[i], "ratio": "0"})
-            return values
-
-        try:
-            first_six = [float(all_numbers[i]) for i in range(min(6, len(all_numbers)))]
-            if len(first_six) == 6:
-                is_column = (
-                    all(x > 10 for x in first_six[:3]) and
-                    all(x < 100 for x in first_six[3:6])
-                )
-                is_alternate = (
-                    all(first_six[i] > 10 for i in [0, 2, 4]) and
-                    all(first_six[i] < 100 for i in [1, 3, 5])
-                )
-                if is_column:
-                    for i in range(num_years):
-                        values.append({"amount": all_numbers[i], "ratio": all_numbers[i + num_years]})
-                    return values[:num_years]
-                elif is_alternate:
-                    for i in range(0, required_numbers, 2):
-                        values.append({"amount": all_numbers[i], "ratio": all_numbers[i + 1]})
-                    return values[:num_years]
-
-            for i in range(0, min(required_numbers, len(all_numbers)), 2):
-                if i + 1 < len(all_numbers):
-                    values.append({"amount": all_numbers[i], "ratio": all_numbers[i + 1]})
-                else:
-                    values.append({"amount": all_numbers[i], "ratio": "0"})
-        except ValueError:
-            for i in range(0, min(required_numbers, len(all_numbers)), 2):
-                if i + 1 < len(all_numbers):
-                    values.append({"amount": all_numbers[i], "ratio": all_numbers[i + 1]})
-                else:
-                    values.append({"amount": all_numbers[i], "ratio": "0"})
         return values[:num_years]
 
     def _extract_from_balance_sheet(self, result: Dict) -> Dict:
@@ -815,7 +829,10 @@ class FinancialAnalysisExtractor(BaseExtractor):
         years = data.get("years", [])
         if not years:
             years = ["2025年6月", "2024年末", "2023年末"]
+        elif len(years) == 2:
+            years = [f"{y}年" for y in years]
 
+        num_periods = len(years[:3])
         has_flow = len(data.get("flow_assets", [])) > 0
         has_total = len(data.get("total", [])) > 0
         if not has_flow and not has_total:
@@ -825,12 +842,13 @@ class FinancialAnalysisExtractor(BaseExtractor):
         for year in years[:3]:
             header += f" | {year}金额（万元） | {year}占比"
         header += " |"
-        separator = "|" + "|".join(["---"] * (1 + len(years[:3]) * 2)) + "|"
+        separator = "|" + "|".join(["---"] * (1 + num_periods * 2)) + "|"
 
-        rows = ["| **流动资产** | | | | | | |"]
+        empty_cells = " |" + " |" * num_periods * 2
+        rows = [f"| **流动资产**{empty_cells}"]
         for item in data.get("flow_assets", []):
             row = f"| {item['name']}"
-            for v in item['values'][:3]:
+            for v in item['values'][:num_periods]:
                 row += f" | {v['amount']} | {v['ratio']}%"
             row += " |"
             rows.append(row)
@@ -838,15 +856,15 @@ class FinancialAnalysisExtractor(BaseExtractor):
         flow_total = data.get("flow_total", [])
         if flow_total:
             row = "| **流动资产合计**"
-            for v in flow_total[:3]:
+            for v in flow_total[:num_periods]:
                 row += f" | **{v['amount']}** | **{v['ratio']}%**"
             row += " |"
             rows.append(row)
 
-        rows.append("| **非流动资产** | | | | | | |")
+        rows.append(f"| **非流动资产**{empty_cells}")
         for item in data.get("non_flow_assets", []):
             row = f"| {item['name']}"
-            for v in item['values'][:3]:
+            for v in item['values'][:num_periods]:
                 row += f" | {v['amount']} | {v['ratio']}%"
             row += " |"
             rows.append(row)
@@ -854,7 +872,7 @@ class FinancialAnalysisExtractor(BaseExtractor):
         non_flow_total = data.get("non_flow_total", [])
         if non_flow_total:
             row = "| **非流动资产合计**"
-            for v in non_flow_total[:3]:
+            for v in non_flow_total[:num_periods]:
                 row += f" | **{v['amount']}** | **{v['ratio']}%**"
             row += " |"
             rows.append(row)
@@ -862,7 +880,7 @@ class FinancialAnalysisExtractor(BaseExtractor):
         total = data.get("total", {})
         if total:
             row = "| **资产总计**"
-            for v in total[:3]:
+            for v in total[:num_periods]:
                 row += f" | **{v['amount']}** | **{v['ratio']}%**"
             row += " |"
             rows.append(row)
