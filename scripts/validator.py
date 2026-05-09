@@ -1,286 +1,445 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-提取器测试和验证模块
-用于测试提取质量，验证提取结果
+数据校验模块 — 检查笔记间的数据一致性
+
+校验规则：
+1. 资产平衡：资产总计 = 流动资产合计 + 非流动资产合计（05-资产结构分析）
+2. 资金用途：募集资金用途比例合计应接近 100%（02-募集资金运用）
+3. 规模一致性：同一发行人的发行规模在各笔记中应一致（01 vs 02）
+4. 必填字段：各类型笔记的必填字段检查
 """
 
 import os
 import re
 import json
-from typing import Dict, List, Any, Optional
+import sys
+from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, asdict
 from datetime import datetime
 
 
+# ============================================================================
+# 数据类型
+# ============================================================================
+
 @dataclass
-class ValidationReport:
-    """验证报告"""
-    file: str
+class ValidationIssue:
+    """校验问题"""
     issuer: str
     note_type: str
-    total_fields: int
-    filled_fields: int
-    missing_fields: List[str]
-    confidence: float
-    warnings: List[str]
-    timestamp: str
+    rule: str
+    severity: str  # "error" | "warning"
+    message: str
 
 
-class ExtractionValidator:
-    """提取结果验证器"""
+# ============================================================================
+# 校验规则
+# ============================================================================
 
-    # 各类型笔记的必填字段
-    REQUIRED_FIELDS = {
-        "bond_terms": ["issuer", "issue_scale", "bond_type", "bond_term"],
-        "fund_usage": ["issuer", "total_amount"],
-        "issuer_profile": ["issuer", "registered_capital"],
+class FinancialBalanceChecker:
+    """资产平衡校验：资产总计 = 流动资产合计 + 非流动资产合计"""
+
+    RULE_NAME = "financial_balance"
+
+    @staticmethod
+    def check(content: str, issuer: str) -> List[ValidationIssue]:
+        issues = []
+        lines = content.split('\n')
+
+        current_total = {}  # col_idx -> value
+        asset_total = {}    # col_idx -> value
+        non_current_items = []  # col_idx -> list of values per year
+
+        # The columns we care about: col 1=2025, col 3=2024, col 5=2023
+        TARGET_COLS = {1: '2025', 3: '2024', 5: '2023'}
+        CURRENT_ROW_FOUND = False
+
+        for line in lines:
+            if '|' not in line:
+                continue
+            cells = [c.strip().strip('*') for c in line.split('|')[1:-1]]
+            if len(cells) < 7:
+                continue
+
+            project = cells[0].strip('*')
+
+            if '流动资产合计' in project:
+                for col_idx in TARGET_COLS:
+                    if col_idx < len(cells):
+                        val = parse_number(cells[col_idx])
+                        if val:
+                            current_total[col_idx] = val
+                CURRENT_ROW_FOUND = True
+            elif '资产总计' in project:
+                for col_idx in TARGET_COLS:
+                    if col_idx < len(cells):
+                        val = parse_number(cells[col_idx])
+                        if val:
+                            asset_total[col_idx] = val
+            elif CURRENT_ROW_FOUND and '资产总计' not in project:
+                # Collect non-current asset items
+                for col_idx in TARGET_COLS:
+                    if col_idx < len(cells):
+                        val = parse_number(cells[col_idx])
+                        if val and col_idx not in current_total:
+                            non_current_items.append((col_idx, val))
+
+        # Check balance: current_total + non_current_sum should ≈ asset_total
+        # Aggregate non-current items by column
+        non_current_sum = {}
+        for col_idx, val in non_current_items:
+            non_current_sum[col_idx] = non_current_sum.get(col_idx, 0) + val
+
+        for col_idx in TARGET_COLS:
+            year = TARGET_COLS[col_idx]
+            if col_idx in current_total and col_idx in asset_total and col_idx in non_current_sum:
+                expected = current_total[col_idx] + non_current_sum[col_idx]
+                actual = asset_total[col_idx]
+                if abs(expected - actual) / actual > 0.05:  # 5% tolerance
+                    diff = expected - actual
+                    issues.append(ValidationIssue(
+                        issuer=issuer,
+                        note_type="financial_analysis",
+                        rule=FinancialBalanceChecker.RULE_NAME,
+                        severity="error",
+                        message=f"{year}年资产不平衡：流动资产({current_total[col_idx]:.0f}) + 非流动资产({non_current_sum[col_idx]:.0f}) = {expected:.0f}，但资产总计={actual:.0f}，差值={diff:+.0f} ({diff/actual*100:.1f}%)"
+                    ))
+                elif abs(expected - actual) / actual > 0.01:
+                    issues.append(ValidationIssue(
+                        issuer=issuer,
+                        note_type="financial_analysis",
+                        rule=FinancialBalanceChecker.RULE_NAME,
+                        severity="warning",
+                        message=f"{year}年资产轻微不平衡：流动资产+非流动资产={expected:.0f} vs 资产总计={actual:.0f}，差值={expected-actual:+.0f}"
+                    ))
+
+        return issues
+
+
+class FundUsageChecker:
+    """资金用途比例校验：合计应接近 100%"""
+
+    RULE_NAME = "fund_usage_total"
+
+    @staticmethod
+    def check(content: str, issuer: str) -> List[ValidationIssue]:
+        issues = []
+
+        # 查找表格中的"合计"行
+        for match in re.finditer(r'\|\s*\*\*合计\*\*\s*\|\s*([^|]+)\s*\|\s*([^|]+)\s*\|', content):
+            amount_str = match.group(1).strip()
+            pct_str = match.group(2).strip().replace('%', '')
+            try:
+                pct = float(pct_str)
+                if abs(pct - 100) > 1:  # 1% 容差
+                    issues.append(ValidationIssue(
+                        issuer=issuer,
+                        note_type="fund_usage",
+                        rule=FundUsageChecker.RULE_NAME,
+                        severity="error",
+                        message=f"资金用途比例合计={pct}%，不等于100%"
+                    ))
+            except ValueError:
+                pass
+
+        return issues
+
+
+class ScaleConsistencyChecker:
+    """跨笔记发行规模一致性校验"""
+
+    RULE_NAME = "scale_consistency"
+
+    @staticmethod
+    def check(terms_content: str, fund_content: str, issuer: str) -> List[ValidationIssue]:
+        issues = []
+
+        terms_scale = extract_scale(terms_content, "本期发行规模")
+        fund_scale = extract_scale(fund_content, "发行规模")
+
+        if terms_scale and fund_scale:
+            if abs(terms_scale - fund_scale) / max(terms_scale, fund_scale) > 0.01:
+                issues.append(ValidationIssue(
+                    issuer=issuer,
+                    note_type="cross_note",
+                    rule=ScaleConsistencyChecker.RULE_NAME,
+                    severity="warning",
+                    message=f"发行规模不一致：发行条款={terms_scale}亿，募集资金运用={fund_scale}亿"
+                ))
+
+        return issues
+
+
+class RevenueSumChecker:
+    """营业收入分板块合计校验"""
+
+    RULE_NAME = "revenue_sum"
+
+    @staticmethod
+    def check(content: str, issuer: str) -> List[ValidationIssue]:
+        issues = []
+        # 查找营业收入表格中的合计行
+        lines = content.split('\n')
+        in_revenue_section = False
+        header_found = False
+
+        for line in lines:
+            if '营业收入' in line and '###' in line:
+                in_revenue_section = True
+                header_found = False
+                continue
+            if in_revenue_section and line.startswith('###'):
+                in_revenue_section = False
+                continue
+            if in_revenue_section and '|' in line:
+                cells = [c.strip() for c in line.split('|')[1:-1]]
+                if not header_found:
+                    header_found = True
+                    continue
+                if '合计' in line:
+                    # 检查占比列是否接近 100%
+                    for col_idx in range(2, len(cells), 2):
+                        if col_idx < len(cells):
+                            pct_str = cells[col_idx].replace('%', '').strip()
+                            try:
+                                pct = float(pct_str)
+                                if abs(pct - 100) > 1:
+                                    issues.append(ValidationIssue(
+                                        issuer=issuer,
+                                        note_type="business_analysis",
+                                        rule=RevenueSumChecker.RULE_NAME,
+                                        severity="error",
+                                        message=f"营业收入占比合计={pct}%，不等于100%"
+                                    ))
+                            except ValueError:
+                                pass
+                    break
+
+        return issues
+
+
+class RequiredFieldChecker:
+    """必填字段检查"""
+
+    REQUIRED = {
+        "bond_terms": ["issuer"],
+        "fund_usage": ["issuer"],
+        "issuer_profile": ["issuer"],
         "business_analysis": ["issuer"],
         "financial_analysis": ["issuer"],
     }
 
-    # 各类型笔记的所有字段
-    ALL_FIELDS = {
-        "bond_terms": [
-            "issuer", "bond_type", "period", "year", "register_scale",
-            "issue_scale", "bond_term", "guarantee", "credit_rating",
-            "bond_rating", "interest_rate", "repayment_method"
-        ],
-        "fund_usage": [
-            "issuer", "bond_type", "issue_scale", "debt_repayment",
-            "supplement_flow", "guarantee", "rating_issuer", "rating_bond"
-        ],
-        "issuer_profile": [
-            "issuer", "registered_capital", "paid_in_capital",
-            "legal_representative", "establishment_date",
-            "unified_social_credit_code", "registered_address", "office_address"
-        ],
-        "business_analysis": [
-            "issuer", "overview", "revenue_structure", "main_products", "business_model"
-        ],
-        "financial_analysis": [
-            "issuer", "total_assets_2024", "total_assets_2023", "total_assets_2022",
-            "total_liabilities_2024", "operating_revenue_2024", "net_profit_2024"
-        ],
-    }
+    RULE_NAME = "required_fields"
+
+    @staticmethod
+    def check(content: str, issuer: str, note_type: str) -> List[ValidationIssue]:
+        issues = []
+        required = RequiredFieldChecker.REQUIRED.get(note_type, [])
+
+        # 检查 frontmatter
+        fm_match = re.match(r'^---\s*\n(.*?)\n---', content, re.DOTALL)
+        if fm_match:
+            fm_text = fm_match.group(1)
+            for field in required:
+                if field not in fm_text:
+                    issues.append(ValidationIssue(
+                        issuer=issuer,
+                        note_type=note_type,
+                        rule=RequiredFieldChecker.RULE_NAME,
+                        severity="warning",
+                        message=f"frontmatter 缺失必填字段: {field}"
+                    ))
+
+        return issues
+
+
+# ============================================================================
+# 工具函数
+# ============================================================================
+
+def parse_number(s: str) -> Optional[float]:
+    """从字符串解析数字，支持千分位逗号"""
+    s = s.strip().replace(',', '')
+    # 移除 ** 等 markdown 标记
+    s = s.replace('**', '')
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def extract_scale(content: str, field_name: str) -> Optional[float]:
+    """从笔记中提取规模数值（亿元）"""
+    # 尝试从表格提取
+    match = re.search(rf'\|\s*{field_name}[^|]*\|\s*([^|]+)\s*\|', content)
+    if match:
+        val = match.group(1).strip()
+        # 匹配 "X亿元" 或 "X亿"
+        num_match = re.search(r'(\d+(?:\.\d+)?)\s*亿', val)
+        if num_match:
+            return float(num_match.group(1))
+
+    # 尝试从 bullet 提取
+    match = re.search(rf'{field_name}.*?(\d+(?:\.\d+)?)\s*亿', content)
+    if match:
+        return float(match.group(1))
+
+    return None
+
+
+def extract_issuer_from_path(filepath: str) -> str:
+    """从文件路径提取发行人名称"""
+    name = os.path.basename(filepath).replace('.md', '')
+    suffixes = ['-发行条款', '-募集资金运用', '-概况', '-主营业务', '-资产结构分析']
+    for suffix in suffixes:
+        if name.endswith(suffix):
+            return name[:-len(suffix)]
+    return name
+
+
+DIR_TYPE_MAP = {
+    "01-发行条款": "bond_terms",
+    "02-募集资金运用": "fund_usage",
+    "03-发行人基本情况": "issuer_profile",
+    "04-主营业务分析": "business_analysis",
+    "05-资产结构分析": "financial_analysis",
+}
+
+
+# ============================================================================
+# 主校验器
+# ============================================================================
+
+class DataValidator:
+    """数据校验器"""
 
     def __init__(self, knowledge_dir: str = "knowledge"):
         self.knowledge_dir = knowledge_dir
-        self.reports: List[ValidationReport] = []
+        self.issues: List[ValidationIssue] = []
+        self.notes_cache: Dict[str, Dict[str, str]] = {}  # issuer -> {type: content}
 
-    def validate_note(self, md_path: str) -> Optional[ValidationReport]:
-        """
-        验证单个笔记文件
+    def validate_all(self) -> List[ValidationIssue]:
+        """运行所有校验规则"""
+        self.issues = []
+        self._load_notes()
 
-        Args:
-            md_path: Markdown 文件路径
-
-        Returns:
-            验证报告
-        """
-        try:
-            with open(md_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-
-            # 提取文件名和类型
-            filename = os.path.basename(md_path)
-            dir_name = os.path.basename(os.path.dirname(md_path))
-
-            # 确定笔记类型
-            note_type = self._guess_note_type(dir_name)
-            if not note_type:
-                return None
-
-            # 提取发行人
-            issuer_match = re.search(r'(.+?)-', filename)
-            issuer = issuer_match.group(1) if issuer_match else "未知"
-
-            # 获取必填字段和所有字段
-            required = self.REQUIRED_FIELDS.get(note_type, [])
-            all_fields = self.ALL_FIELDS.get(note_type, [])
-
-            # 检查字段填充情况
-            filled = 0
-            missing = []
-
-            for field in all_fields:
-                if self._check_field(content, field):
-                    filled += 1
-                else:
-                    if field in required:
-                        missing.append(field)
-
-            # 生成警告
-            warnings = []
-            if missing:
-                warnings.append(f"缺失必填字段：{missing}")
-
-            # 计算置信度
-            confidence = filled / len(all_fields) if all_fields else 0
-
-            return ValidationReport(
-                file=md_path,
-                issuer=issuer,
-                note_type=note_type,
-                total_fields=len(all_fields),
-                filled_fields=filled,
-                missing_fields=missing,
-                confidence=confidence,
-                warnings=warnings,
-                timestamp=datetime.now().isoformat()
-            )
-
-        except Exception as e:
-            print(f"验证失败 {md_path}: {e}")
-            return None
-
-    def _guess_note_type(self, dir_name: str) -> Optional[str]:
-        """根据目录名猜测笔记类型"""
-        mapping = {
-            "01-发行条款": "bond_terms",
-            "02-募集资金运用": "fund_usage",
-            "03-发行人基本情况": "issuer_profile",
-            "04-主营业务分析": "business_analysis",
-            "05-资产结构分析": "financial_analysis",
-        }
-        return mapping.get(dir_name)
-
-    def _check_field(self, content: str, field: str) -> bool:
-        """检查字段是否有值"""
-        # 检查 frontmatter
-        frontmatter_match = re.search(r'---\n(.+?)\n---', content, re.DOTALL)
-        if frontmatter_match:
-            frontmatter = frontmatter_match.group(1)
-            if field in frontmatter:
-                return True
-
-        # 检查表格中的值
-        table_match = re.search(
-            rf'\|\s*[^|]*{field}[^|]*\|\s*([^|]+)\s*\|',
-            content, re.IGNORECASE
-        )
-        if table_match:
-            value = table_match.group(1).strip()
-            # 排除空值和占位符
-            if value and value not in ['/', '', '详见募集说明书原文', '{}']:
-                return True
-
-        # 检查正文内容
-        if field in content.lower():
-            return True
-
-        return False
-
-    def validate_all(self) -> List[ValidationReport]:
-        """验证所有笔记文件"""
-        reports = []
-
-        for dir_name in [
-            "01-发行条款", "02-募集资金运用", "03-发行人基本情况",
-            "04-主营业务分析", "05-资产结构分析"
-        ]:
+        # 逐文件校验
+        for dir_name, note_type in DIR_TYPE_MAP.items():
             dir_path = os.path.join(self.knowledge_dir, dir_name)
             if not os.path.exists(dir_path):
                 continue
 
+            for md_file in sorted(os.listdir(dir_path)):
+                if not md_file.endswith('.md'):
+                    continue
+                filepath = os.path.join(dir_path, md_file)
+                with open(filepath, 'r', encoding='utf-8') as f:
+                    content = f.read()
+
+                issuer = extract_issuer_from_path(filepath)
+
+                # 必填字段检查
+                self.issues.extend(RequiredFieldChecker.check(content, issuer, note_type))
+
+                # 财务平衡检查
+                if note_type == "financial_analysis":
+                    self.issues.extend(FinancialBalanceChecker.check(content, issuer))
+
+                # 资金用途检查
+                if note_type == "fund_usage":
+                    self.issues.extend(FundUsageChecker.check(content, issuer))
+
+                # 营收合计检查
+                if note_type == "business_analysis":
+                    self.issues.extend(RevenueSumChecker.check(content, issuer))
+
+        # 跨笔记一致性检查
+        for issuer, notes in self.notes_cache.items():
+            if "bond_terms" in notes and "fund_usage" in notes:
+                self.issues.extend(
+                    ScaleConsistencyChecker.check(
+                        notes["bond_terms"], notes["fund_usage"], issuer
+                    )
+                )
+
+        return self.issues
+
+    def _load_notes(self):
+        """缓存所有笔记内容（用于跨笔记校验）"""
+        for dir_name, note_type in DIR_TYPE_MAP.items():
+            dir_path = os.path.join(self.knowledge_dir, dir_name)
+            if not os.path.exists(dir_path):
+                continue
             for md_file in os.listdir(dir_path):
                 if not md_file.endswith('.md'):
                     continue
+                filepath = os.path.join(dir_path, md_file)
+                issuer = extract_issuer_from_path(filepath)
+                with open(filepath, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                if issuer not in self.notes_cache:
+                    self.notes_cache[issuer] = {}
+                self.notes_cache[issuer][note_type] = content
 
-                md_path = os.path.join(dir_path, md_file)
-                report = self.validate_note(md_path)
-                if report:
-                    reports.append(report)
-
-        self.reports = reports
-        return reports
-
-    def print_summary(self, reports: List[ValidationReport] = None):
-        """打印验证摘要"""
-        if not reports:
-            reports = self.reports
-
-        if not reports:
-            print("没有验证报告")
+    def print_summary(self):
+        """打印校验摘要"""
+        if not self.issues:
+            print("\n" + "=" * 60)
+            print("数据校验通过：所有检查项均正常")
+            print("=" * 60)
             return
 
+        errors = [i for i in self.issues if i.severity == "error"]
+        warnings = [i for i in self.issues if i.severity == "warning"]
+
         print("\n" + "=" * 60)
-        print("提取质量验证摘要")
+        print("数据校验报告")
         print("=" * 60)
+        print(f"错误：{len(errors)}  警告：{len(warnings)}  总计：{len(self.issues)}")
 
-        # 总体统计
-        total = len(reports)
-        avg_confidence = sum(r.confidence for r in reports) / total if total else 0
+        if errors:
+            print(f"\n{'='*40}")
+            print("错误（需修正）:")
+            for i in errors:
+                print(f"  [{i.issuer}] {i.rule}: {i.message}")
 
-        print(f"验证文件数：{total}")
-        print(f"平均置信度：{avg_confidence:.1%}")
+        if warnings:
+            print(f"\n{'='*40}")
+            print("警告（建议检查）:")
+            for i in warnings[:20]:  # 限制显示数量
+                print(f"  [{i.issuer}] {i.rule}: {i.message}")
+            if len(warnings) > 20:
+                print(f"  ... 还有 {len(warnings) - 20} 条警告")
 
-        # 按类型统计
-        by_type: Dict[str, List[ValidationReport]] = {}
-        for report in reports:
-            if report.note_type not in by_type:
-                by_type[report.note_type] = []
-            by_type[report.note_type].append(report)
-
-        print("\n按类型统计:")
-        for note_type, type_reports in sorted(by_type.items()):
-            avg = sum(r.confidence for r in type_reports) / len(type_reports)
-            low_quality = sum(1 for r in type_reports if r.confidence < 0.5)
-            print(f"  {note_type}: {len(type_reports)} 文件，"
-                  f"平均 {avg:.1%}, 低质量 {low_quality}")
-
-        # 低质量文件列表
-        low_quality_reports = [r for r in reports if r.confidence < 0.5]
-        if low_quality_reports:
-            print("\n低质量文件 (置信度 < 50%):")
-            for r in low_quality_reports[:10]:  # 只显示前 10 个
-                print(f"  - {r.issuer} ({r.note_type}): {r.confidence:.1%}")
-
-    def export_report(self, output_path: str, format: str = "json"):
-        """导出验证报告"""
-        if format == "json":
-            data = [asdict(r) for r in self.reports]
-            with open(output_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-        elif format == "markdown":
-            lines = ["# 提取质量验证报告\n"]
-            for r in self.reports:
-                lines.append(f"## {r.issuer} - {r.note_type}")
-                lines.append(f"- 文件：{r.file}")
-                lines.append(f"- 置信度：{r.confidence:.1%}")
-                lines.append(f"- 缺失字段：{r.missing_fields}")
-                if r.warnings:
-                    lines.append(f"- 警告：{r.warnings}")
-                lines.append("")
-            with open(output_path, 'w', encoding='utf-8') as f:
-                '\n'.join(lines)
+    def export_json(self, output_path: str):
+        """导出 JSON 报告"""
+        data = {
+            "timestamp": datetime.now().isoformat(),
+            "total_issues": len(self.issues),
+            "errors": len([i for i in self.issues if i.severity == "error"]),
+            "warnings": len([i for i in self.issues if i.severity == "warning"]),
+            "issues": [asdict(i) for i in self.issues],
+        }
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
 
 
 def main():
     """主函数"""
     import argparse
 
-    parser = argparse.ArgumentParser(description="验证提取结果质量")
-    parser.add_argument(
-        "--export",
-        type=str,
-        default=None,
-        help="导出报告路径"
-    )
-    parser.add_argument(
-        "--knowledge-dir",
-        type=str,
-        default="knowledge",
-        help="知识库目录"
-    )
+    parser = argparse.ArgumentParser(description="数据校验")
+    parser.add_argument("--knowledge-dir", type=str, default="knowledge")
+    parser.add_argument("--export", type=str, default=None, help="导出 JSON 报告路径")
     args = parser.parse_args()
 
-    validator = ExtractionValidator(args.knowledge_dir)
-    reports = validator.validate_all()
-    validator.print_summary(reports)
+    validator = DataValidator(args.knowledge_dir)
+    issues = validator.validate_all()
+    validator.print_summary()
 
     if args.export:
-        validator.export_report(args.export)
+        validator.export_json(args.export)
         print(f"\n报告已导出：{args.export}")
 
 

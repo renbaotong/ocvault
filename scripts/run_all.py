@@ -36,6 +36,7 @@ class BatchRunner:
         ("extract_issuer_profile.py", "发行人基本情况提取"),
         ("extract_business_analysis.py", "主营业务分析提取"),
         ("extract_financial_analysis.py", "财务分析提取"),
+        ("validator.py", "数据校验"),
     ]
 
     def __init__(self, base_dir: str = None):

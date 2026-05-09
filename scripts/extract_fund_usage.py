@@ -126,15 +126,26 @@ class FundUsageExtractor(BaseExtractor):
 
                     # 业务规则验证：金额在0.1-15亿范围内（允许更小的金额）
                     if 0.1 <= amount <= 15 and usage_name and len(usage_name) >= 2:
+                        # 过滤掉明显的误捕获：包含"不足""不可""不得"等否定词
+                        if any(kw in usage_name for kw in ['不足', '不可', '不得', '无法', '不能']):
+                            continue
                         # 清理用途名称
                         usage_name = self._clean_usage_name(usage_name)
+                        if not usage_name or usage_name == "募集资金用途":
+                            continue
 
                         # 避免重复添加（允许0.01亿误差）
-                        if not any(abs(u["amount"] - amount) < 0.01 for u in usages):
-                            usages.append({
-                                "amount": amount,
-                                "name": usage_name
-                            })
+                        existing = next((u for u in usages if abs(u["amount"] - amount) < 0.01), None)
+                        if not existing:
+                            # 同名称去重：如果名称相同，合并金额
+                            same_name = next((u for u in usages if u["name"] == usage_name), None)
+                            if same_name:
+                                same_name["amount"] = round(same_name["amount"] + amount, 2)
+                            else:
+                                usages.append({
+                                    "amount": amount,
+                                    "name": usage_name
+                                })
                 except (ValueError, IndexError):
                     continue
 
@@ -170,6 +181,11 @@ class FundUsageExtractor(BaseExtractor):
         name = name.strip()
         # 移除句末的标点
         name = name.rstrip('。,.，')
+
+        # 过滤掉明显不是用途的文本
+        invalid_keywords = ['偿债保障', '可变现', '不足', '不可', '不得', '无法', '不能', '风险', '提示']
+        if any(kw in name for kw in invalid_keywords):
+            return ""
 
         # 简化常见的用途描述
         replacements = {
@@ -293,109 +309,6 @@ class FundUsageExtractor(BaseExtractor):
 
         return ""
 
-    def _extract_debt_repayment(self, clean: str, decoded: str) -> str:
-        """提取偿还债务金额 - 在第三节募集资金运用章节内提取"""
-        # 获取募集资金运用章节文本
-        section_text = self._extract_section_text()
-
-        if not section_text or len(section_text) < 100:
-            # 如果章节提取失败，在全文中搜索
-            search_text = clean
-        else:
-            search_text = section_text
-
-        # 使用用户提供的关键字优化提取
-        # 格式: 本期债券募集资金...用于... / 本期债券计划发行规模...用于...
-        patterns = [
-            # 用户提供的关键字模式
-            r"本期债券募集资金[^\n]{0,50}?(\d+(?:\.\d+)?)\s*亿元[^\n]{0,30}?用于[^\n]{0,30}?偿还",
-            r"本期债券计划发行规模[^\n]{0,50}?(\d+(?:\.\d+)?)\s*亿元[^\n]{0,30}?用于[^\n]{0,30}?偿还",
-            r"本次公司债券募集资金[^\n]{0,50}?(\d+(?:\.\d+)?)\s*亿元[^\n]{0,30}?用于[^\n]{0,30}?偿还",
-            r"本期债券的募集资金[^\n]{0,50}?(\d+(?:\.\d+)?)\s*亿元[^\n]{0,30}?用于[^\n]{0,30}?偿还",
-            r"本期公司债券募集资金[^\n]{0,50}?(\d+(?:\.\d+)?)\s*亿元[^\n]{0,30}?用于[^\n]{0,30}?偿还",
-            # 备选模式
-            r"募集资金[^\n]{0,30}?(\d+(?:\.\d+)?)\s*亿元[^\n]{0,30}?用于[^\n]{0,30}?偿还[有息债务]",
-            r"(\d+(?:\.\d+)?)\s*亿元[^\n]{0,30}?用于[^\n]{0,30}?偿还有息[债务负债]",
-            r"拟使用募集资金[^\n]{0,30}?(\d+(?:\.\d+)?)\s*亿元[^\n]{0,30}?用于[^\n]{0,30}?偿还",
-            r"偿还[^\n]{0,20}?(\d+(?:\.\d+)?)\s*亿元",
-            r"用于偿还[^\n]{0,20}?(\d+(?:\.\d+)?)\s*亿元",
-        ]
-
-        for pattern in patterns:
-            match = re.search(pattern, search_text)
-            if match:
-                val = float(match.group(1))
-                # 业务规则：单笔金额在1-15亿范围内
-                if 1 <= val <= 15:
-                    return f"{val} 亿元"
-
-        return ""
-
-    def _extract_supplement_flow(self, clean: str, decoded: str) -> str:
-        """提取补充流动资金金额 - 在第三节募集资金运用章节内提取"""
-        # 获取募集资金运用章节文本
-        section_text = self._extract_section_text()
-
-        if not section_text or len(section_text) < 100:
-            # 如果章节提取失败，在全文中搜索
-            search_text = clean
-        else:
-            search_text = section_text
-
-        # 使用用户提供的关键字优化提取
-        # 格式: 本期债券募集资金...用于...补充流动资金
-        patterns = [
-            # 用户提供的关键字模式
-            r"本期债券募集资金[^\n]{0,50}?(\d+(?:\.\d+)?)\s*亿元[^\n]{0,30}?用于[^\n]{0,30}?补充[流动资金营运资金]",
-            r"本期债券计划发行规模[^\n]{0,50}?(\d+(?:\.\d+)?)\s*亿元[^\n]{0,30}?用于[^\n]{0,30}?补充[流动资金营运资金]",
-            r"本次公司债券募集资金[^\n]{0,50}?(\d+(?:\.\d+)?)\s*亿元[^\n]{0,30}?用于[^\n]{0,30}?补充[流动资金营运资金]",
-            r"本期债券的募集资金[^\n]{0,50}?(\d+(?:\.\d+)?)\s*亿元[^\n]{0,30}?用于[^\n]{0,30}?补充[流动资金营运资金]",
-            r"本期公司债券募集资金[^\n]{0,50}?(\d+(?:\.\d+)?)\s*亿元[^\n]{0,30}?用于[^\n]{0,30}?补充[流动资金营运资金]",
-            # 备选模式
-            r"募集资金[^\n]{0,30}?(\d+(?:\.\d+)?)\s*亿元[^\n]{0,30}?用于[^\n]{0,30}?补充流动资金",
-            r"(\d+(?:\.\d+)?)\s*亿元[^\n]{0,30}?用于[^\n]{0,30}?补充流动资金",
-            r"(\d+(?:\.\d+)?)\s*亿元[^\n]{0,30}?用于[^\n]{0,30}?补充营运资金",
-            r"拟使用募集资金[^\n]{0,30}?(\d+(?:\.\d+)?)\s*亿元[^\n]{0,30}?用于[^\n]{0,30}?补充",
-            r"补充流动资金[^\n]{0,20}?(\d+(?:\.\d+)?)\s*亿元",
-            r"用于补充[^\n]{0,20}?(\d+(?:\.\d+)?)\s*亿元",
-        ]
-
-        for pattern in patterns:
-            match = re.search(pattern, search_text)
-            if match:
-                val = float(match.group(1))
-                # 业务规则：单笔金额在1-15亿范围内
-                if 1 <= val <= 15:
-                    return f"{val} 亿元"
-
-        return ""
-
-    def _check_all_for_debt(self, clean: str, decoded: str) -> bool:
-        """检查是否全部用于偿还"""
-        patterns = [
-            r"全部.*?用于.*?偿还",
-            r"全部.*?用于.*?有息债务",
-        ]
-
-        for pattern in patterns:
-            if re.search(pattern, clean):
-                return True
-
-        return False
-
-    def _check_after_fees(self, clean: str, decoded: str) -> bool:
-        """检查是否有扣除发行费用后的描述"""
-        patterns = [
-            r"扣除发行费用后.*?用于",
-            r"ծȯ.*?ļʽ.*?۳.*?зú",  # 乱码版本
-        ]
-
-        for pattern in patterns:
-            if re.search(pattern, clean) or re.search(pattern, decoded):
-                return True
-
-        return False
-
     def _extract_usage_detail(self, clean: str) -> Dict[str, str]:
         """提取使用明细（偿还有息债务、补充流动资金等）"""
         result = {"debt": "", "flow": ""}
@@ -458,31 +371,6 @@ class FundUsageExtractor(BaseExtractor):
                     break
 
         return result
-
-    def _fallback_extraction(
-        self,
-        clean: str,
-        decoded: str,
-        usage: Dict[str, str]
-    ):
-        """备用提取方案"""
-        # 查找所有数字，并验证业务规则（1-15亿）
-        all_amounts = re.findall(r'(\d+\.\d+)\s*[元Ԫ]', clean)
-
-        valid_amounts = []
-        for amt in all_amounts:
-            try:
-                val = float(amt)
-                if 1 <= val <= 15:
-                    valid_amounts.append(amt)
-            except ValueError:
-                pass
-
-        if valid_amounts and len(valid_amounts) >= 2:
-            if not usage["debt_repayment"]:
-                usage["debt_repayment"] = f"{valid_amounts[0]} 亿元"
-            if not usage["supplement_flow"] and len(valid_amounts) > 1:
-                usage["supplement_flow"] = f"{valid_amounts[1]} 亿元"
 
     def _read_registration_scale_from_bond_terms(self) -> str:
         """从发行条款笔记读取发行规模"""
@@ -603,36 +491,7 @@ class FundUsageExtractor(BaseExtractor):
 
         return info
 
-    def extract_fund_usage_detail(self) -> str:
-        """提取资金用途详细描述"""
-        self.extract_text()
-        clean = self.full_text.replace('\n', '')
-
-        # 查找募集资金运用章节
-        patterns = [
-            r"(?:募集资金运用 | 募集资金使用计划 | 募集资金用途 | 本期债券募集资金用途).*?"
-            r"(?=第 [一二三四五六七八九十][、节]|重要提示 | 风险因素 | 释义 | 目录)",
-        ]
-
-        for pattern in patterns:
-            match = re.search(pattern, clean, re.DOTALL)
-            if match:
-                detail = match.group(0)[:3000]
-                detail = re.sub(r'<[^>]+>', '', detail)
-                detail = re.sub(r'\n\s*\n', '\n\n', detail)
-                # 过滤掉目录内容
-                if not re.search(r'\d{2,}', detail):
-                    return detail.strip()
-
-        # 尝试提取包含资金用途描述的段落
-        match = re.search(
-            r"本期债券募集资金.*?(?:用于 | 拟用于).*?[\u3000-\u9fa5]{50,500}",
-            clean
-        )
-        if match:
-            detail = match.group(0)[:1500]
-            return re.sub(r'<[^>]+>', '', detail)
-
+    def extract_fund_usage_detail(self) -> str:  # deprecated, kept for API compatibility
         return ""
 
     def generate_note(self, output_base: str) -> str:
@@ -724,7 +583,11 @@ class FundUsageExtractor(BaseExtractor):
 
         frontmatter = self.get_frontmatter(
             note_type=self.NOTE_TYPE,
-            tags=self.TAGS + [f"#{info['bond_type']}"]
+            tags=self.TAGS + [f"#{info['bond_type']}"],
+            extra_fields={
+                "issuer": info.get("issuer", ""),
+                "bond_type": info.get("bond_type", ""),
+            }
         )
 
         template = f"""{frontmatter}

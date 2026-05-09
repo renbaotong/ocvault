@@ -284,9 +284,9 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
         text_lower = page_text
 
         # 查找各章节的标题位置
-        revenue_patterns = ['营业收入构成', '营业收入情况', '营业收入如下', '分板块营业收入', '主营业务收入构成', '主营业务板块收入', '营业收入结构', '营业收入构成情况']
-        cost_patterns = ['营业成本构成', '营业成本情况', '营业成本如下', '主营业务成本构成', '主营业务成本情况', '主营业务成本如下', '营业成本构成情况', '成本构成情况']
-        margin_patterns = ['毛利率构成', '毛利率情况', '毛利率如下', '毛利润构成', '毛利润情况', '毛利润如下', '营业毛利率构成', '营业毛利润构成', '各业务板块毛利润', '各业务板块毛利率']
+        revenue_patterns = ['营业收入构成', '营业收入情况', '营业收入如下', '分板块营业收入', '主营业务收入构成', '主营业务板块收入', '营业收入结构', '营业收入构成情况', '主营业务收入情况', '主营业务收入如下']
+        cost_patterns = ['营业成本构成', '营业成本情况', '营业成本如下', '主营业务成本构成', '主营业务成本情况', '主营业务成本如下', '营业成本构成情况', '成本构成情况', '主营业务成本情况表']
+        margin_patterns = ['毛利率构成', '毛利率情况', '毛利率如下', '毛利润构成', '毛利润情况', '毛利润如下', '营业毛利率构成', '营业毛利润构成', '各业务板块毛利润', '各业务板块毛利率', '主营业务毛利润情况']
 
         def find_first_position(patterns, text):
             min_pos = len(text)
@@ -941,6 +941,16 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
                         if tinfo['table_idx'] == ti_idx:
                             type_candidates[hint_type].append((pn, ti_idx, len(tinfo['table'])))
                             break
+
+            # 修复：当同一页面所有表格都被分配为同一类型时（通常因为共享业务名称
+            # 导致位置推断失效），清除 hints，改由 _identify_table_type_v3 的表头匹配处理
+            if len(page_tables) >= 2:
+                hints_for_page = [table_type_hints.get((page_num, ti)) for ti in range(len(page_tables))]
+                non_none_hints = [h for h in hints_for_page if h is not None]
+                if non_none_hints and len(set(non_none_hints)) == 1:
+                    # 所有表格都被分配为同一类型，清除 hints
+                    for ti in range(len(page_tables)):
+                        table_type_hints.pop((page_num, ti), None)
 
             # 如果有多个页面有同一类型的表格，保留行数最多的
             for hint_type, candidates in type_candidates.items():
@@ -1600,6 +1610,13 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
         if has_scenic:
             return None
 
+        # 排除24：利润表摘要/简表（包含税金及附加、期间费用、营业利润等行项目）
+        # 这类表格是损益表的浓缩版，不是分板块的营业成本明细表
+        has_income_summary = all(kw in all_text for kw in ['税金及附加', '期间费用', '营业利润']) and \
+                             not re.search(r'业务板块|业务名称|分板块', all_text)
+        if has_income_summary:
+            return None
+
         # ===== 第二步：提取表格数据特征 =====
 
         # 统计数字类型 - 改进：同时检测千分位格式和普通小数格式
@@ -1639,9 +1656,9 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
             '业务板块', '业务板块名称', '业务名称', '业务类型', '业务种类'
         ])
 
-        # 检查关键词
-        has_revenue = '营业收入' in all_text
-        has_cost = '营业成本' in all_text
+        # 检查关键词（包括主营业务收入/成本变体）
+        has_revenue = '营业收入' in all_text or '主营业务收入' in all_text
+        has_cost = '营业成本' in all_text or '主营业务成本' in all_text
         has_margin = '毛利率' in all_text
         has_profit = '毛利润' in all_text
 
@@ -1652,10 +1669,11 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
         has_revenue_in_page = '营业收入' in page_lower
 
         # 表头关键词
-        # 注意：只匹配"营业收入"完整词，不匹配单独的"收入"（可能是"收入确认方式"等）
-        has_revenue_header = ('营业收入' in header_text) and '成本' not in header_text and '毛利率' not in header_text
-        has_cost_header = '营业成本' in header_text and '收入' not in header_text and '毛利率' not in header_text
-        has_margin_header = '毛利率' in header_text
+        # 注意：同时匹配"营业收入"和"主营业务收入"变体
+        has_revenue_header = (('营业收入' in header_text or '主营业务收入' in header_text)
+                              and '成本' not in header_text and '毛利率' not in header_text and '毛利润' not in header_text)
+        has_cost_header = ('营业成本' in header_text or '主营业务成本' in header_text) and '收入' not in header_text and '毛利率' not in header_text
+        has_margin_header = '毛利率' in header_text or '毛利润' in header_text
 
         num_cols = len(table[0]) if table else 0
 
@@ -1911,7 +1929,11 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
 
         frontmatter = self.get_frontmatter(
             note_type=self.NOTE_TYPE,
-            tags=self.TAGS + [f"#{info['bond_type']}"]
+            tags=self.TAGS + [f"#{info['bond_type']}"],
+            extra_fields={
+                "issuer": info.get("issuer", ""),
+                "bond_type": info.get("bond_type", ""),
+            }
         )
 
         # 格式化表格内容

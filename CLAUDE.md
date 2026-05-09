@@ -10,7 +10,12 @@
 ocvault/
 ├── raw/                    # 原始 PDF
 ├── knowledge/              # Obsidian 知识库
-│   ├── 00-Meta/           # 索引（发行人索引、债券索引）
+│   ├── _templates/        # 笔记模板（5 类）
+│   ├── 00-Meta/           # 索引 + Dataview 视图
+│   │   ├── 发行人索引.md   # Dataview 动态查询
+│   │   ├── 债券索引.md     # Dataview 动态查询
+│   │   ├── 债券对比.md     # 多债券对比表
+│   │   └── 评级汇总.md     # 评级/增信统计
 │   ├── 01-发行条款/       # 债券发行条款
 │   ├── 02-募集资金运用/   # 资金用途
 │   ├── 03-发行人基本情况/ # 发行人概况
@@ -23,7 +28,9 @@ ocvault/
     │   ├── config.py      # 正则模式配置
     │   ├── utils.py       # 工具函数
     │   └── equity_paddle_ocr.py  # 股权架构图 OCR
-    └── run_all.py         # 批量运行入口
+    ├── run_all.py         # 批量运行入口
+    ├── generate_meta_index.py  # 生成静态索引（可被 Dataview 替代）
+    └── migrate_frontmatter.py  # 一次性 frontmatter 迁移脚本
 ```
 
 **命名约定**: `{发行人全称}-{内容类型}.md`
@@ -66,7 +73,7 @@ pip install PyMuPDF pdfplumber
 # 可选：股权架构图 OCR（需要 PaddleOCR）
 pip install paddlepaddle paddleocr
 
-# Obsidian 插件：Dataview, Templater
+# Obsidian 插件：Dataview（已安装）、Templates（核心插件，已配置 _templates 目录）
 ```
 
 ## 笔记类型
@@ -77,7 +84,7 @@ pip install paddlepaddle paddleocr
 | 02-募集资金运用 | `{发行人}-募集资金运用.md` | 资金用途、偿债计划、使用明细 |
 | 03-发行人基本情况 | `{发行人}-概况.md` | 注册资本、法人、股权架构 |
 | 04-主营业务分析 | `{发行人}-主营业务.md` | 营业收入、成本、毛利率分板块表 |
-| 05-资产结构分析 | `{发行人}- 资产结构分析.md` | 流动资产/非流动资产/资产总计 |
+| 05-资产结构分析 | `{发行人}-资产结构分析.md` | 流动资产/非流动资产/资产总计 |
 
 ## 注意事项
 

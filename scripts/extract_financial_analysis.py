@@ -613,9 +613,14 @@ class FinancialAnalysisExtractor(BaseExtractor):
         years = []
         combined_text = ' '.join(lines[:100])
         # 支持多种日期格式：2024年12月31日、2024年末、2024/12/31、2024年9月末
+        # 以及合并后的单字换行格式：2025年9月末2024年度/末2023年度/末（无空格）
         for pattern in [r"(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日",
                         r"(\d{4})\s*年\s*(\d{1,2})\s*月末",
                         r"(\d{4})\s*年末",
+                        r"(\d{4})\s*年度\s*/\s*末",
+                        r"(\d{4})年(\d{1,2})月末",
+                        r"(\d{4})年度/末",
+                        r"(\d{4})年末",
                         r"(\d{4})/(\d{1,2})/(\d{1,2})"]:
             matches = re.findall(pattern, combined_text)
             if matches:
@@ -625,10 +630,18 @@ class FinancialAnalysisExtractor(BaseExtractor):
                         years.append(year_str)
 
         if len(years) < 2:
+            # Also try to find years in merged lines like "2025年9月末2024年度/末2023年度/末"
+            for i in range(min(30, len(lines))):
+                line = lines[i].strip()
+                merged_year_matches = re.findall(r'(\d{4})\s*(?:年|年度)', line)
+                for y in merged_year_matches:
+                    if y not in years:
+                        years.append(y)
+
             for i in range(min(50, len(lines) - 3)):
                 line = lines[i].strip()
                 if re.match(r'^\d{4}$', line):
-                    for j in range(i+1, min(i+3, len(lines))):
+                    for j in range(i+1, min(i+5, len(lines))):
                         if '年' in lines[j] or '末' in lines[j] or '月' in lines[j]:
                             if line not in years:
                                 years.append(line)
@@ -791,8 +804,48 @@ class FinancialAnalysisExtractor(BaseExtractor):
                             return result
         return result
 
+    def _find_high_ratio_items(self, data: Dict, threshold: float = 20.0) -> List[str]:
+        """
+        从资产结构数据中找出最新一期占比超过阈值的单项资产
+
+        Args:
+            data: extract_financial_data 返回的数据
+            threshold: 占比阈值（百分比），默认 20%
+
+        Returns:
+            占比超过阈值的资产项目名称列表
+        """
+        high_items = []
+        all_items = data.get("flow_assets", []) + data.get("non_flow_assets", [])
+
+        # 不需要提取明细的流动资产项目
+        skip_items = {"货币资金", "存货"}
+
+        for item in all_items:
+            # 跳过不需要提取明细的项目
+            if item["name"] in skip_items:
+                continue
+            values = item.get("values", [])
+            if values:
+                # 取最新一期的占比
+                latest_ratio = values[0].get("ratio", "0")
+                try:
+                    ratio = float(str(latest_ratio).replace("%", ""))
+                    if ratio > threshold:
+                        high_items.append(item["name"])
+                except (ValueError, TypeError):
+                    pass
+
+        return high_items
+
     def extract_financial_data(self) -> Dict:
-        return self._extract_table_from_pages()
+        data = self._extract_table_from_pages()
+        # 找出占比>20%的单项资产
+        high_ratio_items = self._find_high_ratio_items(data, threshold=20.0)
+        if high_ratio_items:
+            print(f"  占比>20%的资产项目: {high_ratio_items}")
+        data["high_ratio_items"] = high_ratio_items
+        return data
 
     def generate_note(self, output_base: str) -> str:
         info = {
@@ -801,10 +854,15 @@ class FinancialAnalysisExtractor(BaseExtractor):
         }
         financial_data = self.extract_financial_data()
         table_content = self._build_asset_table(financial_data)
+        detail_content = self._build_detail_section(financial_data)
 
         frontmatter = self.get_frontmatter(
             note_type=self.NOTE_TYPE,
-            tags=self.TAGS + [f"#{info['bond_type']}"]
+            tags=self.TAGS + [f"#{info['bond_type']}"],
+            extra_fields={
+                "issuer": info.get("issuer", ""),
+                "bond_type": info.get("bond_type", ""),
+            }
         )
 
         template = f"""{frontmatter}
@@ -813,7 +871,7 @@ class FinancialAnalysisExtractor(BaseExtractor):
 ## 发行人最近两年及一期末资产构成情况
 
 {table_content}
-
+{detail_content}
 ---
 **来源**: {self.pdf_name}
 **提取日期**: {datetime.now().strftime('%Y-%m-%d')}
@@ -824,6 +882,239 @@ class FinancialAnalysisExtractor(BaseExtractor):
         )
         self.write_note(output_path, template)
         return output_path
+
+    def _extract_asset_description(self, item_name: str) -> str:
+        """
+        从募集说明书中提取资产项目的构成说明和变动原因描述。
+
+        搜索策略（按优先级）：
+        1. 构成描述："{item_name}主要由/包括...构成"
+        2. 变动说明："{item_name}较...增加/减少...主要系...所致"
+        3. 上下文窗口：asset name附近包含描述性关键词的句子
+
+        Args:
+            item_name: 资产项目名称
+
+        Returns:
+            提取的描述文本，无匹配时返回空字符串
+        """
+        # 优先在第五节搜索，扩大范围到全文
+        search_texts = []
+        section5 = self._get_section_5_text()
+        if section5:
+            search_texts.append(section5)
+        self.extract_text()
+        if self.full_text and self.full_text != section5:
+            search_texts.append(self.full_text)
+
+        results = []
+        seen = set()
+
+        for text in search_texts:
+            # 合并换行用于模式匹配（PDF碎片化）
+            merged = text.replace('\n', '').replace('\r', '')
+            escaped_name = re.escape(item_name)
+
+            # 策略1：构成描述
+            comp_patterns = [
+                escaped_name + r'主要由(.{3,80}?)(?:构成|组成)',
+                escaped_name + r'主要包括(.{3,80}?)',
+                r'发行人' + escaped_name + r'主要由(.{3,80}?)(?:构成|组成)',
+                r'发行人' + escaped_name + r'主要包括(.{3,80}?)',
+                escaped_name + r'的主要构成(?:包括|为|如下)?(.{3,80}?)',
+            ]
+            for pat in comp_patterns:
+                for m in re.finditer(pat, merged):
+                    # 从匹配起点（包含item_name）提取完整句子
+                    sentence = self._extract_sentence_from_merged(merged, m.start(), m.end())
+                    if sentence and item_name in sentence:
+                        norm = self._normalize_text(sentence)
+                        if norm not in seen and len(norm) > 5:
+                            seen.add(norm)
+                            results.append(sentence)
+
+            # 策略2：变动说明
+            change_patterns = [
+                escaped_name + r'较.{0,20}?(?:增加|减少|增长|下降)[^。；]*?(?:主要)?系(.{3,120}?)(?:所致)',
+                escaped_name + r'(?:的)?(?:大幅)?(?:增加|减少|变动)[，,;；]*?(?:主要)?系(.{3,120}?)(?:所致)',
+                r'发行人' + escaped_name + r'较.{0,30}?(?:增加|减少|增长|下降)[^。；]*?(?:主要)?系(.{3,120}?)(?:所致)',
+                r'发行人' + escaped_name + r'(?:的)?(?:大幅)?(?:增加|减少|变动)[，,;；]*?(?:主要)?系(.{3,120}?)(?:所致)',
+                escaped_name + r'[^。；]*(?:增加|减少|变动)[^。；]*主要系[^。；]{3,120}?所致',
+            ]
+            for pat in change_patterns:
+                for m in re.finditer(pat, merged):
+                    # 跳过只有数字的匹配（表格噪声）
+                    context = merged[max(0, m.start()-20):m.end()+20]
+                    if len(re.findall(r'[\d,]+\.?\d+', context)) > 6:
+                        continue
+                    sentence = self._extract_sentence_from_merged(merged, m.start(), m.end())
+                    if sentence and item_name in sentence:
+                        norm = self._normalize_text(sentence)
+                        if norm not in seen and len(norm) > 5:
+                            seen.add(norm)
+                            results.append(sentence)
+
+            # 策略3：上下文窗口 - 搜索包含描述性关键词且包含item_name的句子
+            if len(results) < 2:
+                desc_keywords = ['主要由', '主要包括', '主要系', '系', '所致', '变动原因', '变化']
+                # 用句号/分号分割句子（合并文本中仍可能有分号）
+                sentences = re.split(r'[。；]', merged)
+                for sent in sentences:
+                    if item_name not in sent:
+                        continue
+                    if any(kw in sent for kw in desc_keywords):
+                        # 过滤：item_name 必须是主语（句子开头附近），而非被列举的多个项目之一
+                        # 如果句子形如"非流动资产主要由A、B、item_name和C构成"，跳过
+                        if re.search(r'(?:非流动|流动|总)?资产主要由[^，,]{0,30}' + re.escape(item_name), sent):
+                            continue
+                        # 过滤：不能是表格数据
+                        if self._is_descriptive_sentence(sent, item_name):
+                            norm = self._normalize_text(sent)
+                            if norm not in seen and len(norm) > 10:
+                                seen.add(norm)
+                                results.append(sent.strip())
+
+            if results:
+                break  # 在第五节找到就停止
+
+        # 去重并返回
+        if not results:
+            return ""
+
+        # 进一步去重：如果一条结果是另一条的子串，保留较短的
+        final = []
+        for r in results:
+            norm = self._normalize_text(r)
+            is_subset = False
+            for other in results:
+                if other == r:
+                    continue
+                other_norm = self._normalize_text(other)
+                if norm in other_norm and len(norm) < len(other_norm):
+                    is_subset = True
+                    break
+            if not is_subset:
+                final.append(r)
+
+        return '\n'.join(final[:3])  # 最多3条描述
+
+    def _extract_sentence_from_merged(self, text: str, match_start: int, match_end: int) -> str:
+        """从合并 PDF 文本中提取包含匹配位置的完整描述性句子。
+
+        PDF 合并文本中表格数据和叙述文本连在一起，没有句号分隔。
+        策略：优先以 item_name 作为句子起点（因为模式都匹配在 item_name 上），
+        向前只找紧邻的描述性主语（如"发行人"），不回退到表格区域。
+        """
+        # 关键：从 match_start 往前找很短的距离，看是否有主语词
+        # 因为所有模式都锚定在 item_name 上，match_start 通常就在 item_name 开头
+        prefix = text[max(0, match_start - 15):match_start]
+
+        # 如果前面紧邻"发行人"，从"发行人"开始
+        issuer_match = re.search(r'发行人$', prefix)
+        if issuer_match:
+            sent_start = max(0, match_start - 15) + issuer_match.start()
+        else:
+            # 否则从 match_start 开始（已经是 item_name 的位置）
+            sent_start = match_start
+
+        # 向后找句子结束
+        sent_end = text.find('。', match_end)
+        if sent_end < 0:
+            sent_end = text.find('；', match_end)
+        if sent_end < 0:
+            sent_end = min(len(text), match_end + 200)
+        else:
+            sent_end += 1
+
+        return text[sent_start:sent_end].strip()
+
+    def _normalize_text(self, text: str) -> str:
+        """标准化文本用于去重比较"""
+        return re.sub(r'[\s，,。；.！!？?、：:（）()""\'\[\]【】]', '', text)
+
+    def _is_descriptive_sentence(self, sentence: str, item_name: str) -> bool:
+        """判断句子是否为描述性文本（而非表格数据）"""
+        # 过滤纯数字为主的句子
+        chinese_chars = len(re.findall(r'[一-鿿]', sentence))
+        digits = len(re.findall(r'\d', sentence))
+        if digits > chinese_chars * 2:
+            return False
+        # 必须包含item_name
+        if item_name not in sentence:
+            return False
+        # 不能太短
+        if len(sentence) < 15:
+            return False
+        # 不能是表头/单位行
+        if re.match(r'^单位[：:]', sentence):
+            return False
+        if re.match(r'^表[：:]', sentence):
+            return False
+        # 不能包含太多数字块（表格特征）— 收紧阈值
+        num_blocks = len(re.findall(r'[\d,]+\.?\d+', sentence))
+        if num_blocks > 4:
+            return False
+        # 必须包含描述性关键词
+        desc_keywords = ['主要由', '主要包括', '主要系', '系', '所致', '变动原因',
+                         '构成', '组成', '包括', '增加', '减少', '增长', '下降',
+                         '变化', '划转', '划拨', '新增', '减少', '变化']
+        if not any(kw in sentence for kw in desc_keywords):
+            return False
+        return True
+
+    def _build_detail_section(self, data: Dict) -> str:
+        """构建重要资产项目（最新一期占比>20%）的主要构成情况"""
+        high_ratio_items = data.get("high_ratio_items", [])
+        years = data.get("years", [])
+
+        if not high_ratio_items:
+            return ""
+
+        # 格式化年份标签，与_build_asset_table保持一致
+        if not years:
+            years = ["2025年6月", "2024年末", "2023年末"]
+        elif len(years) == 2:
+            years = [f"{y}年" for y in years]
+
+        section = "\n## 重要资产项目主要构成情况\n\n"
+        section += "> 最近一期或一年，发行人非流动资产中单项资产项目占比大于20%的，汇总其主要构成情况。\n\n"
+
+        for item_name in high_ratio_items:
+            # 获取该项目的数据
+            all_items = data.get("flow_assets", []) + data.get("non_flow_assets", [])
+            item_data = None
+            for item in all_items:
+                if item["name"] == item_name:
+                    item_data = item
+                    break
+
+            if not item_data:
+                continue
+
+            values = item_data.get("values", [])
+            if not values:
+                continue
+
+            section += f"### {item_name}\n\n"
+
+            # 构建数值描述
+            period_descs = []
+            for i, v in enumerate(values):
+                amount = v.get("amount", "-")
+                ratio = v.get("ratio", "-")
+                year_label = years[i] if i < len(years) else f"第{i+1}期"
+                period_descs.append(f"{year_label}金额为{amount}万元，占比{ratio}%")
+
+            section += "；".join(period_descs) + "。"
+
+            # 提取并追加描述性文本
+            desc = self._extract_asset_description(item_name)
+            if desc:
+                section += "\n\n" + desc
+
+            section += "\n\n"
+
+        return section
 
     def _build_asset_table(self, data: Dict) -> str:
         years = data.get("years", [])

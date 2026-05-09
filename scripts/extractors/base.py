@@ -306,7 +306,7 @@ class BaseExtractor:
         period = period_match.group(0) if period_match else ""
 
         # 提取年份
-        year_match = re.search(r'(20\d{2} 年)', name)
+        year_match = re.search(r'(20\d{2}年)', name)
         year = year_match.group(0) if year_match else ""
 
         self._bond_info = BondInfo(
@@ -414,22 +414,29 @@ class BaseExtractor:
             self._logger.error(f"写入失败：{e}")
             return False
 
-    def get_frontmatter(self, note_type: str, tags: List[str]) -> str:
+    def get_frontmatter(self, note_type: str, tags: List[str], extra_fields: Optional[Dict[str, Any]] = None) -> str:
         """
         生成 Frontmatter
 
         Args:
             note_type: 笔记类型
             tags: 标签列表
+            extra_fields: 额外的 frontmatter 字段（如 issuer, bond_short, bond_type, year 等）
 
         Returns:
             Frontmatter 字符串
         """
         tags_str = ', '.join(tags)
-        return f"""---
-created: {datetime.now().strftime('%Y-%m-%d')}
-type: {note_type}
-tags: [{tags_str}]
----
-
-"""
+        lines = [
+            "---",
+            f"created: {datetime.now().strftime('%Y-%m-%d')}",
+            f"type: {note_type}",
+            f"tags: [{tags_str}]",
+        ]
+        if extra_fields:
+            for key, value in extra_fields.items():
+                if value:
+                    lines.append(f"{key}: {value}")
+        lines.append("---")
+        lines.append("")
+        return "\n".join(lines)

@@ -40,36 +40,54 @@ class IssuerProfileExtractor(BaseExtractor):
         super().__init__(pdf_path)
 
     def _extract_section_after(self, after_pattern: str, start_patterns: list, end_patterns: list) -> str:
-        """在某个模式之后提取章节内容"""
+        """在某个模式之后提取章节内容 - 增强版，跳过 TOC 引用"""
         self.extract_text()
 
-        base_idx = -1
-        if after_pattern:
-            base_idx = self.full_text.find(after_pattern)
-            if base_idx < 0:
-                base_idx = self.full_text.find(after_pattern.replace(' ', ''))
-            if base_idx < 0:
-                base_idx = self.full_text.find(after_pattern.replace(' ', '\n'))
-            if base_idx < 0:
-                base_idx = self.full_text.find(after_pattern.replace('发行人基本情况', ' 发行人基本情况'))
-            if base_idx < 0:
-                return ""
-
-        search_start = base_idx if base_idx >= 0 else 0
+        # 策略1：直接在全文中搜索 start_patterns，跳过 TOC 条目
         start_idx = -1
-
         for pattern in start_patterns:
-            idx = self.full_text.find(pattern, search_start)
-            if idx >= 0:
-                idx2 = self.full_text.find(pattern, idx + len(pattern))
-                if idx2 >= 0:
-                    start_idx = idx2
+            idx = -1
+            while True:
+                idx = self.full_text.find(pattern, idx + 1)
+                if idx < 0:
                     break
-                else:
-                    next_chars = self.full_text[idx:idx + 100]
-                    if '....' in next_chars or '.. 46' in next_chars or '.. 47' in next_chars:
-                        continue
-                    else:
+                # 检查是否是 TOC 条目（后面跟大量点号+页码）
+                next_chars = self.full_text[idx:idx + 200]
+                next_clean = next_chars.replace('\n', '')
+                # TOC 特征：紧跟 pattern 后有 4+ 个点号
+                after_text = next_clean[len(pattern):]
+                has_toc_dots = after_text.lstrip(' \t').startswith('....')
+                has_toc_ref = after_text.lstrip(' \t')[:1] in ['"', '\"', "'", "'", '之', ',', '，']
+                if has_toc_dots or has_toc_ref:
+                    continue
+                start_idx = idx
+                break
+            if start_idx >= 0:
+                break
+
+        # 策略2：如果没找到，尝试通过 after_pattern 定位后再搜索
+        if start_idx < 0 and after_pattern:
+            base_idx = -1
+            for variant in [
+                after_pattern,
+                after_pattern.replace(' ', ''),
+                after_pattern.replace(' ', '\n'),
+            ]:
+                bidx = self.full_text.find(variant)
+                if bidx >= 0:
+                    base_idx = bidx
+                    break
+
+            if base_idx >= 0:
+                for pattern in start_patterns:
+                    idx = self.full_text.find(pattern, base_idx)
+                    if idx >= 0:
+                        next_chars = self.full_text[idx:idx + 200]
+                        next_clean = next_chars.replace('\n', '')
+                        after_text = next_clean[len(pattern):]
+                        has_toc_dots = after_text.lstrip(' \t').startswith('....')
+                        if has_toc_dots:
+                            continue
                         start_idx = idx
                         break
 
@@ -102,56 +120,114 @@ class IssuerProfileExtractor(BaseExtractor):
         # 进一步处理：移除多余的HTML标签和页码标记
         clean = re.sub(r'<[^>]+>', '', clean)
         clean = re.sub(r'\.{3,}\s*\d+\s*$', '', clean, flags=re.MULTILINE)
+        # 单字换行格式后处理：修复字段名和值之间的连接问题
+        clean = self._postprocess_char_format(clean)
+
+        # 额外生成一个"表格模式"的文本：将 | 分隔的表格行转换为 key: value 格式
+        table_clean = self._convert_table_format(clean)
+
+        # 合并搜索：在 clean 和 table_clean 中同时搜索
+        search_texts = [clean, table_clean]
 
         # 1. 提取注册名称
         name_patterns = [
-            r'(?:注册名称|公司名称|企业名称)\s*[:：]\s*\n?\s*([^\n]+?)(?=\n\s*(?:法定代表|注册资本|实缴资本|设立日期|统一社会信用代码|注册地址|所属行业|经营范围|二、|$))',
-            r'(?:注册名称|公司名称|企业名称)\s*[:：]?\s*\n?\s*([^\n]+?)(?=\n\s*(?:法定代表|注册资本|实缴资本|设立日期|统一社会信用代码|注册地址|所属行业|经营范围|二、|$))',
+            r'(?:注册名称|公司名称|企业名称)\s*[:：|]\s*\n?\s*([\s\S]+?)(?=\n\s*(?:法定代表|注册资本|实缴资本|设立日期|统一社会信用代码|注册地址|所属行业|经营范围|企业类型|二、|$))',
+            r'(?:注册名称|公司名称|企业名称)\s*[:：|]?\s*\n?\s*([\s\S]+?)(?=\n\s*(?:法定代表|注册资本|实缴资本|设立日期|统一社会信用代码|注册地址|所属行业|经营范围|企业类型|二、|$))',
         ]
         for pattern in name_patterns:
-            match = re.search(pattern, clean, re.DOTALL)
-            if match:
-                result["注册名称"] = self._clean_field_value(match.group(1))
+            for st in search_texts:
+                match = re.search(pattern, st, re.DOTALL)
+                if match:
+                    result["注册名称"] = self._clean_field_value(match.group(1))
+                    break
+            if result["注册名称"]:
                 break
 
         if not result["注册名称"] and self._issuer_name:
             result["注册名称"] = self._issuer_name
 
-        # 2. 提取注册资本 - 增强版，处理多行和多种格式
+        # 2. 提取注册资本
         capital_patterns = [
-            r'注册资本\s*[:：]?\s*\n?\s*人民币?\s*\n?\s*([\d,\.]+)\s*\n?\s*(万元|亿元|元)',
-            r'注册资本\s*[:：]?\s*\n?\s*([\d,\.]+)\s*\n?\s*(万元|亿元|元)',
-            r'注册资本\s*[:：]?\s*\n?\s*(?:为)?\s*\n?\s*人民币?\s*\n?\s*([\d,\.]+)',
+            r'注册资本\s*[:：|]\s*\n?\s*人民币?\s*\n?\s*([\d,\.]+)\s*\n?\s*(万人民币|万元|亿元|元)',
+            r'注册资本\s*[:：|]\s*\n?\s*([\d,\.]+)\s*\n?\s*(万人民币|万元|亿元|元)',
+            r'注册资本\s*[:：|]\s*\n?\s*(?:为)?\s*\n?\s*人民币?\s*\n?\s*([\d,\.]+)',
         ]
         for pattern in capital_patterns:
-            match = re.search(pattern, clean)
-            if match:
-                value = self._clean_field_value(match.group(1))
-                unit = match.group(2) if len(match.groups()) > 1 and match.group(2) else "万元"
-                result["注册资本"] = value + unit
+            for st in search_texts:
+                match = re.search(pattern, st)
+                if match:
+                    value = self._clean_field_value(match.group(1))
+                    unit = match.group(2) if len(match.groups()) > 1 and match.group(2) else "万元"
+                    result["注册资本"] = value + unit
+                    break
+            if result["注册资本"]:
                 break
 
-        # 3. 提取实缴资本 - 增强版
+        # 3. 提取实缴资本
         paid_in_patterns = [
-            r'(?:实缴资本|实收资本)\s*[:：]?\s*\n?\s*人民币?\s*\n?\s*([\d,\.]+)\s*\n?\s*(万元|亿元|元)',
-            r'(?:实缴资本|实收资本)\s*[:：]?\s*\n?\s*([\d,\.]+)\s*\n?\s*(万元|亿元|元)',
-            r'(?:实缴资本|实收资本)\s*[:：]?\s*\n?\s*(?:为)?\s*\n?\s*人民币?\s*\n?\s*([\d,\.]+)',
+            r'(?:实缴资本|实收资本)\s*[:：|]\s*\n?\s*人民币?\s*\n?\s*([\d,\.]+)\s*\n?\s*(万人民币|万元|亿元|元)',
+            r'(?:实缴资本|实收资本)\s*[:：|]\s*\n?\s*([\d,\.]+)\s*\n?\s*(万人民币|万元|亿元|元)',
+            r'(?:实缴资本|实收资本)\s*[:：|]\s*\n?\s*(?:为)?\s*\n?\s*人民币?\s*\n?\s*([\d,\.]+)',
         ]
         for pattern in paid_in_patterns:
-            match = re.search(pattern, clean)
-            if match:
-                value = self._clean_field_value(match.group(1))
-                unit = match.group(2) if len(match.groups()) > 1 and match.group(2) else "万元"
-                result["实缴资本"] = value + unit
+            for st in search_texts:
+                match = re.search(pattern, st)
+                if match:
+                    value = self._clean_field_value(match.group(1))
+                    unit = match.group(2) if len(match.groups()) > 1 and match.group(2) else "万元"
+                    result["实缴资本"] = value + unit
+                    break
+            if result["实缴资本"]:
                 break
 
-        # 4. 提取设立日期 - 增强版，支持逐字换行和多种格式
-        result["设立日期"] = self._extract_establishment_date(clean)
+        # 4. 提取设立日期
+        for st in search_texts:
+            d = self._extract_establishment_date(st)
+            if d:
+                result["设立日期"] = d
+                break
 
-        # 5. 提取经营范围 - 增强版，支持更长的范围和多种格式
-        result["经营范围"] = self._extract_business_scope(clean)
+        # 5. 提取经营范围
+        for st in search_texts:
+            s = self._extract_business_scope(st)
+            if s:
+                result["经营范围"] = s
+                break
 
         return result
+
+    def _convert_table_format(self, text: str) -> str:
+        """将 | 分隔的表格格式转换为 key: value 格式，便于正则匹配"""
+        lines = text.split('\n')
+        result_lines = []
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            if '|' in line:
+                # 拆分表格行
+                parts = [p.strip() for p in line.split('|')]
+                # 尝试匹配 key-value 对
+                field_keywords = ['注册名称', '公司名称', '法定代表人', '注册资本', '实缴资本',
+                                  '实收资本', '设立日期', '成立日期', '统一社会信用代码',
+                                  '住所', '注册地址', '所属行业', '经营范围', '信息披露事务负责人',
+                                  '设立（工商注册）日期']
+                j = 0
+                while j < len(parts) - 1:
+                    key = parts[j].strip()
+                    val = parts[j + 1].strip()
+                    # 如果当前部分是已知字段名，则转换为 key: value 格式
+                    if any(kw in key for kw in field_keywords) and val:
+                        result_lines.append(f"{key}: {val}")
+                        j += 2
+                    else:
+                        j += 1
+                if j >= len(parts):
+                    i += 1
+                    continue
+            else:
+                result_lines.append(line)
+            i += 1
+        return '\n'.join(result_lines)
 
     def _extract_establishment_date(self, text: str) -> str:
         """
@@ -160,8 +236,8 @@ class IssuerProfileExtractor(BaseExtractor):
         """
         # 先尝试提取标准格式
         standard_patterns = [
-            r'(?:设立日期|成立日期|设立[（(]工商注册[）)]日期)\s*[:：]?\s*(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日',
-            r'(?:设立日期|成立日期|设立[（(]工商注册[）)]日期)\s*[:：]?\s*(\d{4}[年/\-\.]\d{1,2}[月/\-\.]\d{1,2}[日]?)',
+            r'(?:设立日期|成立日期|设立[（(]工商注册[）)]日期)\s*[:：|]?\s*(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日',
+            r'(?:设立日期|成立日期|设立[（(]工商注册[）)]日期)\s*[:：|]?\s*(\d{4}[年/\-\.]\d{1,2}[月/\-\.]\d{1,2}[日]?)',
         ]
 
         for pattern in standard_patterns:
@@ -171,7 +247,15 @@ class IssuerProfileExtractor(BaseExtractor):
                 if len(groups) == 3:
                     return f"{groups[0]}年{groups[1]}月{groups[2]}日"
                 date_str = self._clean_field_value(match.group(1))
+                # 处理 ISO 格式 YYYY-MM-DD
                 iso_match = re.match(r'(\d{4})[-\.](\d{2})[-\.](\d{2})', date_str)
+                if iso_match:
+                    return f"{iso_match.group(1)}年{iso_match.group(2)}月{iso_match.group(3)}日"
+                # 处理 YYYY/M/D 格式
+                slash_match = re.match(r'(\d{4})/(\d{1,2})/(\d{1,2})', date_str)
+                if slash_match:
+                    return f"{slash_match.group(1)}年{slash_match.group(2)}月{slash_match.group(3)}日"
+                iso_match = re.match(r'(\d{4})[-\.](\d{1,2})[-\.](\d{1,2})', date_str)
                 if iso_match:
                     return f"{iso_match.group(1)}年{iso_match.group(2)}月{iso_match.group(3)}日"
                 return date_str
@@ -231,10 +315,10 @@ class IssuerProfileExtractor(BaseExtractor):
         """
         scope_patterns = [
             # 优先匹配"一般项目"开头的经营范围
-            r'经营范围\s*[:：]\s*\n?\s*一般项目[：:]?\s*([^\n]{20,2000}?(?:自主开展经营活动|依法须经批准的项目|经营范围[：；]))',
+            r'经营范围\s*[:：|]\s*\n?\s*一般项目[：:]?\s*([^\n]{20,2000}?(?:自主开展经营活动|依法须经批准的项目|经营范围[：；]))',
             # 匹配经营范围后跟关键截止词
-            r'经营范围\s*[:：]?\s*\n?\s*([\s\S]{30,2000}?)\n\s*(?:电话及传真|电话[:：]|传真[:：]|信息披露事务负责人|联系(?:电话|方式)|网址|所属行业|统一社会信用代码)',
-            r'经营范围\s*[:：]\s*\n?\s*([\s\S]{20,1000}?)\n\s*(?:信息披露事务负责人|联系(?:电话|方式)|传真号码|网址|所属行业|二、发行人)',
+            r'经营范围\s*[:：|]?\s*\n?\s*([\s\S]{30,2000}?)\n\s*(?:电话及传真|电话[:：]|传真[:：]|信息披露事务负责人|联系(?:电话|方式)|网址|所属行业|统一社会信用代码)',
+            r'经营范围\s*[:：|]\s*\n?\s*([\s\S]{20,1000}?)\n\s*(?:信息披露事务负责人|联系(?:电话|方式)|传真号码|网址|所属行业|二、发行人)',
         ]
         for pattern in scope_patterns:
             match = re.search(pattern, text)
@@ -248,7 +332,7 @@ class IssuerProfileExtractor(BaseExtractor):
 
         # 备用方案：从文本中查找经营范围关键词后的内容
         scope_start_patterns = [
-            r'经营范围\s*[:：]\s*',
+            r'经营范围\s*[:：|]\s*',
         ]
         for pattern in scope_start_patterns:
             match = re.search(pattern, text)
@@ -267,6 +351,52 @@ class IssuerProfileExtractor(BaseExtractor):
 
         return ""
 
+    def _convert_field_value_lines(self, text: str) -> str:
+        """将"字段名\n字段值"格式转换为"字段名: 字段值"格式"""
+        field_keywords = ['注册名称', '公司名称', '法定代表人', '注册资本', '实缴资本',
+                          '实收资本', '设立日期', '成立日期', '统一社会信用代码',
+                          '住所', '注册地址', '邮政编码', '所属行业', '经营范围',
+                          '信息披露事务负责人', '设立（工商注册）日期', '企业类型',
+                          '公司注册地址', '联系人', '电话号码', '传真号码']
+        lines = text.split('\n')
+        result = []
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            matched_field = None
+            for kw in field_keywords:
+                if kw in line:
+                    matched_field = kw
+                    break
+            if matched_field and i + 1 < len(lines):
+                # 合并从下一行开始的值（可能跨多行直到遇到下一个字段名或截止词）
+                value_lines = []
+                j = i + 1
+                while j < len(lines):
+                    next_line = lines[j].strip()
+                    if not next_line:
+                        break
+                    # 检查是否是下一个字段名
+                    is_next_field = any(kw in next_line for kw in field_keywords)
+                    # 检查是否是常见的截止词
+                    is_stop_word = any(kw in next_line for kw in
+                        ['二、', '三、', '第四节', '第五节', '电话及传真', '公司电话', '公司传真',
+                         '信息披露事务', '联系方'])
+                    if is_next_field or is_stop_word:
+                        break
+                    value_lines.append(next_line)
+                    j += 1
+                value = ' '.join(value_lines)
+                if value:
+                    result.append(f"{matched_field}: {value}")
+                else:
+                    result.append(line)
+                i = j
+            else:
+                result.append(line)
+                i += 1
+        return '\n'.join(result)
+
     def _preprocess_text(self, text: str) -> str:
         """预处理文本：检测并处理"单字换行"格式"""
         lines = text.split('\n')
@@ -281,6 +411,8 @@ class IssuerProfileExtractor(BaseExtractor):
             clean = re.sub(r'\.{3,}\s*\d+\s*$', '', text, flags=re.MULTILINE)
             clean = re.sub(r'(?<=\n)\s*(?:[4-9]\d|[1-9]\d{2})\s*(?=\n[^\d])', '', clean)
             clean = re.sub(r'\n{3,}', '\n\n', clean)
+            # 处理"字段名\n字段值"格式（无冒号分隔的表格行）
+            clean = self._convert_field_value_lines(clean)
             return clean
 
         result_lines = []
@@ -301,7 +433,7 @@ class IssuerProfileExtractor(BaseExtractor):
                     current_line += ": " + line
                 else:
                     current_line += line
-            elif line in ['万元', '亿元', '元', '年', '月', '日']:
+            elif line in ['万元', '亿元', '元', '年', '月', '日', '）日期', ')日期', '日期']:
                 current_line += line
                 if line in ['年', '月'] and current_line and re.search(r'\d{4}年\d{1,2}月$', current_line):
                     continue
@@ -322,7 +454,12 @@ class IssuerProfileExtractor(BaseExtractor):
                     current_line += line
             else:
                 if current_line:
-                    result_lines.append(current_line + line)
+                    # 如果 current_line 是完整的字段名，添加冒号分隔
+                    is_field = any(current_line == f or current_line.startswith(f) for f in field_names)
+                    if is_field:
+                        result_lines.append(current_line + ": " + line)
+                    else:
+                        result_lines.append(current_line + line)
                     current_line = ""
                 else:
                     result_lines.append(line)
@@ -331,6 +468,71 @@ class IssuerProfileExtractor(BaseExtractor):
             result_lines.append(current_line)
 
         return '\n'.join(result_lines)
+
+    def _postprocess_char_format(self, text: str) -> str:
+        """后处理单字换行格式结果，修复字段名和值之间的连接问题"""
+        field_keywords = ['注册名称', '公司名称', '法定代表人', '注册资本', '实缴资本',
+                          '实收资本', '设立日期', '成立日期', '统一社会信用代码',
+                          '住所', '注册地址', '邮政编码', '所属行业', '经营范围',
+                          '信息披露事务负责人', '设立（工商注册）日期']
+
+        # Step 1: 修复常见 split 字段名
+        # "设立（工\n商注册）日期" -> "设立（工商注册）日期"
+        text = text.replace('设立（工\n商注册）日期', '设立（工商注册）日期')
+        text = text.replace('住\n所', '住所')
+        text = text.replace('法\n定\n代表\n人', '法定代表人')
+        text = text.replace('法\n定代表\n人', '法定代表人')
+
+        # Step 2: 修复字段名后直接跟值但没有冒号的情况
+        for kw in field_keywords:
+            escaped = re.escape(kw)
+            pattern = escaped + r'(?![：:\n\s])([\u4e00-\u9fa5a-zA-Z0-9])'
+            text = re.sub(pattern, kw + ': ' + r'\1', text)
+
+        # Step 3: 修复跨行值
+        lines = text.split('\n')
+        merged = []
+        for line in lines:
+            if merged:
+                prev = merged[-1]
+                for kw in field_keywords:
+                    prefix = kw + ': '
+                    if prev.endswith(prefix):
+                        val_part = prev[len(prefix):]
+                        if 0 < len(val_part) < 30:
+                            merged[-1] = prev + line.strip()
+                            line = None
+                            break
+            if line:
+                merged.append(line)
+        return '\n'.join(merged)
+
+    def _merge_char_newlines(self, text: str) -> str:
+        """修复逐字换行格式，合并被换行分割的连续文本（如：湖\n州\n南\n浔 -> 湖州南浔）"""
+        result = []
+        buffer = ""
+        for line in text.split('\n'):
+            stripped = line.strip()
+            if not stripped:
+                if buffer:
+                    result.append(buffer)
+                    buffer = ""
+                continue
+            is_fragment = (
+                len(stripped) <= 3 and
+                re.match(r'^[一-龥a-zA-Z0-9\s\.\,\;\:\%]+$', stripped) and
+                not re.match(r'^(?:公司|集团|局|政府|办公室|财政局|国资委|管委会|有限公司|发行人|截至|报告|期末|股权|结构|股东|控股|实际|控制人|持有|出资|设立|成立|注册|资本|法定代表人|经营范围|主营业务)$', stripped)
+            )
+            if is_fragment:
+                buffer += stripped
+            else:
+                if buffer:
+                    result.append(buffer)
+                    buffer = ""
+                result.append(stripped)
+        if buffer:
+            result.append(buffer)
+        return '\n'.join(result)
 
     def _clean_field_value(self, value: str) -> str:
         """清理字段值中的多余字符"""
@@ -352,80 +554,18 @@ class IssuerProfileExtractor(BaseExtractor):
         # 预处理文本：清理多余空白，合并被换行分割的文本
         processed_text = re.sub(r'\n+', '\n', section_text)
 
-        # 逐字换行修复：检测并修复极端的逐字换行格式
-        # 例如：湖\n州\n南\n浔 -> 湖州南浔
-        def merge_char_newlines(text):
-            """修复逐字换行格式，合并被换行分割的连续文本"""
-            lines = text.split('\n')
-            result = []
-            buffer = ""
-
-            for line in lines:
-                stripped = line.strip()
-                if not stripped:
-                    if buffer:
-                        result.append(buffer)
-                        buffer = ""
-                    continue
-
-                # 判断是否是逐字换行片段：
-                # 1. 行很短（<=3个字符）
-                # 2. 主要是中文字符、英文、数字或常见标点
-                # 3. 不是完整的句子或常见短语
-                is_fragment = (
-                    len(stripped) <= 3 and
-                    re.match(r'^[一-龥a-zA-Z0-9\s\.\,\;\:\%]+$', stripped) and
-                    not re.match(r'^(?:公司|集团|局|政府|办公室|财政局|国资委|管委会|有限公司|发行人|截至|报告|期末|股权|结构|股东|控股|实际|控制人|持有|出资|设立|成立|注册|资本|法定代表人|经营范围|主营业务)$', stripped)
-                )
-
-                if is_fragment:
-                    buffer += stripped
-                else:
-                    if buffer:
-                        result.append(buffer)
-                        buffer = ""
-                    result.append(stripped)
-
-            if buffer:
-                result.append(buffer)
-
-            return '\n'.join(result)
-
-        processed_text = merge_char_newlines(processed_text)
+        processed_text = self._merge_char_newlines(processed_text)
         processed_text = re.sub(r'\s+', ' ', processed_text)
 
-        # 合并被换行分割的股东名称
+        # 合并被换行分割的股东名称 - 增强版，处理"XX区\nXX办公室"格式
+        processed_text = re.sub(r'([一-龥]{2,6}(?:区|县|市))\s+([^\s]{2,20}?(?:局|办|委|政府|监督管理办公室))',
+                                r'\1\2', processed_text)
         processed_text = re.sub(r'(公司|集团|中心|政府|办公室|财政局|国资委|管委会|有限)[\n\r]+([^\n]{1,20}?(?:公司|集团|中心|政府|办公室|财政局|国资委|管委会))',
                                 r'\1\2', processed_text)
         processed_text = re.sub(r'([一-龥]{2,6}(?:区|县|市))[\n\r]+([^\n]{2,15}?(?:局|办|委|政府))',
                                 r'\1\2', processed_text)
 
-        # 逐字换行修复：检测并修复极端的逐字换行格式
-        # 例如：湖\n州\n南\n浔 -> 湖州南浔
-        def fix_char_by_char_newlines(text):
-            lines = text.split('\n')
-            result = []
-            buffer = ""
-            for line in lines:
-                stripped = line.strip()
-                if not stripped:
-                    if buffer:
-                        result.append(buffer)
-                        buffer = ""
-                    continue
-                # 如果行很短（1-2个字符）且主要是中文字符，可能是逐字换行
-                if len(stripped) <= 2 and re.match(r'^[一-龥\w]+$', stripped):
-                    buffer += stripped
-                else:
-                    if buffer:
-                        result.append(buffer)
-                        buffer = ""
-                    result.append(stripped)
-            if buffer:
-                result.append(buffer)
-            return '\n'.join(result)
-
-        processed_text = fix_char_by_char_newlines(processed_text)
+        processed_text = self._merge_char_newlines(processed_text)
         # 再次清理合并后的空格
         processed_text = re.sub(r'\s+', ' ', processed_text)
 
@@ -589,6 +729,8 @@ class IssuerProfileExtractor(BaseExtractor):
             simple_patterns = [
                 # 模式1: 控股股东为XX公司
                 r'控股股东\s*为\s*[:：]?\s*([^"\'\n，。；]{3,35}?(?:公司|集团|局|政府|办公室|财政局|国资委|管委会|公资办|资产办))',
+                # 模式1b: 控股股东及实际控制人均为XX（处理"均为"格式）
+                r'控股股东及实际控制人均为\s*([^"\'\n，。；]{3,40}?(?:公司|集团|局|政府|办公室|财政局|国资委|管委会|人民政府|公资办|资产办|监督管理办公室))',
                 # 模式2: 实际控制人为XX
                 r'实际控制人\s*为\s*[:：]?\s*([^"\'\n，。；]{3,35}?(?:公司|集团|局|政府|办公室|财政局|国资委|管委会|人民政府|公资办|资产办))',
                 # 模式3: XX公司是控股股东
@@ -751,45 +893,7 @@ class IssuerProfileExtractor(BaseExtractor):
         processed_text = re.sub(r'\n\s*\n', '\n', processed_text)
 
         # 处理逐字换行格式：合并被换行分割的连续中文字符
-        # 例如：湖\n州\n南\n浔 -> 湖州南浔
-        def merge_char_newlines(text):
-            """修复逐字换行格式，合并被换行分割的连续文本"""
-            lines = text.split('\n')
-            result = []
-            buffer = ""
-
-            for line in lines:
-                stripped = line.strip()
-                if not stripped:
-                    if buffer:
-                        result.append(buffer)
-                        buffer = ""
-                    continue
-
-                # 判断是否是逐字换行片段：
-                # 1. 行很短（<=3个字符）
-                # 2. 主要是中文字符、英文、数字或常见标点
-                # 3. 不是完整的句子或常见短语
-                is_fragment = (
-                    len(stripped) <= 3 and
-                    re.match(r'^[一-龥a-zA-Z0-9\s\.\,\;\:\%]+$', stripped) and
-                    not re.match(r'^(?:公司|集团|局|政府|办公室|财政局|国资委|管委会|有限公司|发行人|截至|报告|期末|股权|结构|股东|控股|实际|控制人|持有|出资|设立|成立|注册|资本|法定代表人|经营范围|主营业务)$', stripped)
-                )
-
-                if is_fragment:
-                    buffer += stripped
-                else:
-                    if buffer:
-                        result.append(buffer)
-                        buffer = ""
-                    result.append(stripped)
-
-            if buffer:
-                result.append(buffer)
-
-            return '\n'.join(result)
-
-        processed_text = merge_char_newlines(processed_text)
+        processed_text = self._merge_char_newlines(processed_text)
 
         # 查找"二、"或"（二）"开头的控股股东/实际控制人部分
         controlling_patterns = [
@@ -1182,7 +1286,11 @@ class IssuerProfileExtractor(BaseExtractor):
 
         frontmatter = self.get_frontmatter(
             note_type=self.NOTE_TYPE,
-            tags=self.TAGS + [f"#{info['bond_type']}"]
+            tags=self.TAGS + [f"#{info['bond_type']}"],
+            extra_fields={
+                "issuer": info.get("issuer", ""),
+                "bond_type": info.get("bond_type", ""),
+            }
         )
 
         template = f"""{frontmatter}
