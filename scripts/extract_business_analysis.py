@@ -597,7 +597,19 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
 
         # 毛利润金额表：有显著的 > 1000 的数值
         # 毛利率表：几乎不会有 > 1000 的数值（百分比最大 100 或略超）
-        return very_large_count >= 5
+        if very_large_count >= 5:
+            return True
+
+        # 二次检查：处理 亿元-unit 表格（所有数值都很小，< 1000）
+        # 如果表头包含"毛利润"（非"毛利率"）且有"金额/占比"列结构，
+        # 则是毛利润金额表而非毛利率百分比表
+        header_text = ' '.join([' '.join(row) for row in table[:4]]).lower()
+        has_gross_profit_header = '毛利润' in header_text and '毛利率' not in header_text
+        has_amount_pct_cols = '金额' in header_text and '占比' in header_text
+        if has_gross_profit_header and has_amount_pct_cols:
+            return True
+
+        return False
 
     def _split_combined_table(self, table: List[List[str]], page_text: str) -> Dict[str, List[List[str]]]:
         """
@@ -877,7 +889,7 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
                         for ti, tinfo in enumerate(page_tables):
                             table = tinfo['table']
                             data_rows_check = table[2:] if len(table) > 2 else []
-                            header_check = ' '.join([' '.join(row) for row in table[:2]]).lower()
+                            header_check = ' '.join([' '.join(row) for row in table[:4]]).lower()
                             all_check = ' '.join([' '.join(row) for row in table]).lower()
 
                             is_cost_header = '成本' in header_check and '收入' not in header_check
@@ -985,7 +997,7 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
             for tinfo in page_tables:
                 table = tinfo['table']
                 orig_idx = tinfo['table_idx']
-                header_text_check = ' '.join([' '.join(row) for row in table[:2]]).lower()
+                header_text_check = ' '.join([' '.join(row) for row in table[:4]]).lower()
                 # "收入/占比"且不含"成本"→ 应该是 revenue 而非 cost
                 if ('收入' in header_text_check and '占比' in header_text_check and
                     '成本' not in header_text_check and '毛利率' not in header_text_check and
@@ -1113,7 +1125,7 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
                             # 安全检查：第一个表格必须有收入相关表头，才能分配为 revenue
                             # 避免将成本表误判为收入表（安吉县场景：成本表在收入表前面）
                             if target_type == 'revenue':
-                                t_header = ' '.join([' '.join(row) for row in table[:2]]).lower()
+                                t_header = ' '.join([' '.join(row) for row in table[:4]]).lower()
                                 if '收入' not in t_header:
                                     # 第一个表格不是收入表，跳过 revenue 分配
                                     continue
@@ -1288,7 +1300,7 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
                     if result.get('revenue') and result.get('cost') and result.get('margin'):
                         break
 
-                    header_text_scan = ' '.join([' '.join(row) for row in table[:2]]).lower()
+                    header_text_scan = ' '.join([' '.join(row) for row in table[:4]]).lower()
                     all_text_scan = ' '.join([' '.join(row) for row in table]).lower()
                     data_rows_scan = table[2:] if len(table) > 2 else []
 
@@ -1432,8 +1444,8 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
         if not table or len(table) < 2:
             return None
 
-        # 合并表头文本
-        header_text = ' '.join([' '.join(row) for row in table[:2]]).lower()
+        # 合并表头文本（取前4行以覆盖多层表头结构：标题/单位/年份/金额占比）
+        header_text = ' '.join([' '.join(row) for row in table[:4]]).lower()
         all_text = ' '.join([' '.join(row) for row in table]).lower()
 
         # 获取数据区域
@@ -1694,8 +1706,19 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
                 return "cost" if not result.get('cost') else None
 
         # 毛利率表：必须包含"毛利率"关键词（表格内或表头）
+        # 注意：排除"毛利润"（金额表）+ "金额/占比"结构的情况
         if has_margin_header or has_margin:
-            return "margin"
+            # "毛利润" in header_text 且表格有"金额/占比"列结构 → 是毛利润金额表，不是毛利率百分比表
+            header_has_profit_not_margin = ('毛利润' in header_text and '毛利率' not in header_text)
+            if header_has_profit_not_margin:
+                has_amt_pct = ('金额' in header_text and '占比' in header_text)
+                if has_amt_pct:
+                    # 这是毛利润金额表，不归为 margin
+                    pass
+                else:
+                    return "margin"
+            else:
+                return "margin"
 
         # 辅助判断：页面包含"毛利率"且表格特征符合（少列、小数值、无千分位）
         if has_margin_in_page and num_cols <= 5 and not has_comma_numbers and has_small_decimals:
@@ -1795,12 +1818,21 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
 
         # 基于数据特征的毛利率判断 - 必须包含"毛利率"或"毛利润"关键词
         if has_margin or has_profit:
-            if num_cols <= 4 and has_small_decimals and not has_comma_numbers:
+            # 排除：表头有"毛利润"（非"毛利率"）且有"金额/占比"结构 → 毛利润金额表
+            _header_profit_not_margin = ('毛利润' in header_text and '毛利率' not in header_text)
+            _header_amt_pct = ('金额' in header_text and '占比' in header_text)
+            if _header_profit_not_margin and _header_amt_pct:
+                pass  # 毛利润金额表，不归为 margin
+            elif num_cols <= 4 and has_small_decimals and not has_comma_numbers:
                 return "margin"
-            if num_cols <= 5 and percent_count >= 3 and not has_comma_numbers:
+            elif num_cols <= 5 and percent_count >= 3 and not has_comma_numbers:
                 return "margin"
-            if '毛利率' in header_text or '毛利润' in header_text:
-                return "margin"
+            elif '毛利率' in header_text or '毛利润' in header_text:
+                # 进一步区分：有"金额/占比"结构 + "毛利润"（非"毛利率"）→ 不归类为 margin
+                if _header_profit_not_margin and _header_amt_pct:
+                    pass
+                else:
+                    return "margin"
 
         # 兜底：有业务分类和金额数据的表格
         if (comma_count + numeric_count) >= 3 and has_business_column:
