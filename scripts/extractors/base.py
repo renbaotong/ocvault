@@ -420,13 +420,15 @@ class BaseExtractor:
 
         Args:
             note_type: 笔记类型
-            tags: 标签列表
-            extra_fields: 额外的 frontmatter 字段（如 issuer, bond_short, bond_type, year 等）
+            tags: 标签列表（Obsidian 标签不加 #，Obsidian 会自动添加）
+            extra_fields: 额外的 frontmatter 字段
 
         Returns:
             Frontmatter 字符串
         """
-        tags_str = ', '.join(tags)
+        # Obsidian YAML tags 规范：不带 # 前缀（Obsidian 渲染时自动加 #）
+        # 如 tags: [债券/发行条款, 公司债] 而非 tags: [债券/发行条款, #公司债]
+        tags_str = ', '.join(tags).replace('#', '')
         lines = [
             "---",
             f"created: {datetime.now().strftime('%Y-%m-%d')}",

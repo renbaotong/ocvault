@@ -2,17 +2,16 @@
 # -*- coding: utf-8 -*-
 """
 生成 Meta 索引文件
-生成 knowledge/00-Meta/目录下的两个索引文件：
-- 发行人索引.md
-- 债券索引.md
+生成 knowledge/00-Meta/目录下的索引文件：
+- 发行人索引.md（静态表）
+- 债券索引.md（静态表）
 """
 
 import os
 import re
 import glob
 from datetime import datetime
-from pathlib import Path
-from typing import List, Dict, Optional, Set
+from typing import List, Dict, Optional
 from dataclasses import dataclass, field
 import logging
 
@@ -21,6 +20,25 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
+
+
+# 笔记类型到目录的映射
+NOTE_DIR_MAP = [
+    ("01-发行条款", "bond_terms"),
+    ("02-募集资金运用", "fund_usage"),
+    ("03-发行人基本情况", "issuer_profile"),
+    ("04-主营业务分析", "business_analysis"),
+    ("05-资产结构分析", "financial_analysis"),
+]
+
+# 显示名称映射
+DIR_DISPLAY = {
+    "01-发行条款": "发行条款",
+    "02-募集资金运用": "资金运用",
+    "03-发行人基本情况": "概况",
+    "04-主营业务分析": "主营业务",
+    "05-资产结构分析": "资产结构",
+}
 
 
 @dataclass
@@ -39,6 +57,7 @@ class NoteInfo:
     issue_scale: str = ""
     bond_term: str = ""
     guarantee: str = ""
+    credit_rating: str = ""
 
 
 class MetaIndexGenerator:
@@ -53,17 +72,12 @@ class MetaIndexGenerator:
         """扫描所有笔记文件，提取关键信息"""
         notes = []
 
-        dirs_to_scan = [
-            ("01-发行条款", "bond_terms"),
-            ("03-发行人基本情况", "issuer_profile"),
-        ]
-
-        for dir_name, note_type in dirs_to_scan:
+        for dir_name, note_type in NOTE_DIR_MAP:
             dir_path = os.path.join(self.knowledge_dir, dir_name)
             if not os.path.exists(dir_path):
                 continue
 
-            for md_file in glob.glob(os.path.join(dir_path, "*.md")):
+            for md_file in sorted(glob.glob(os.path.join(dir_path, "*.md"))):
                 info = self._parse_note(md_file)
                 if info:
                     notes.append(info)
@@ -112,7 +126,7 @@ class MetaIndexGenerator:
             return None
 
     def _parse_bond_terms(self, md_path: str) -> Optional[NoteInfo]:
-        """解析发行条款笔记"""
+        """解析发行条款笔记，提取全部字段"""
         try:
             with open(md_path, 'r', encoding='utf-8') as f:
                 content = f.read()
@@ -134,16 +148,20 @@ class MetaIndexGenerator:
             extractors = {
                 'bond_short': r'\| 债券简称 \| (.+?) \|',
                 'bond_type': r'\| 债券类型 \| (.+?) \|',
-                'year': r'\| 发行日期 \| (.+?) \|',
+                'year': r'\| 发行日期 \| (.+?)年 \|',
                 'issue_scale': r'\| 本期发行规模 \| (.+?) \|',
                 'bond_term': r'\| 债券期限 \| (.+?) \|',
                 'guarantee': r'\| 增信措施 \| (.+?) \|',
+                'credit_rating': r'\| 主体评级 \| (.+?) \|',
             }
 
             for attr, pattern in extractors.items():
                 match = re.search(pattern, content)
                 if match:
-                    setattr(data, attr, match.group(1).strip())
+                    val = match.group(1).strip()
+                    # 清理占位符
+                    if val and val != '/':
+                        setattr(data, attr, val)
 
             return data
         except Exception as e:
@@ -166,9 +184,11 @@ class MetaIndexGenerator:
                     'files': {}
                 }
 
-            # 提取标签
-            for tag in re.findall(r'#([\u4e00-\u9fa5A-Za-z]+)', note.tags):
-                issuers[issuer]['tags'].add(f"#{tag}")
+            # 提取标签（YAML tags 规范不带 #）
+            for tag in re.findall(r'([一-龥A-Za-z/]+)', note.tags):
+                tag = tag.strip()
+                if tag and len(tag) > 1 and not tag.isdigit():
+                    issuers[issuer]['tags'].add(tag)
 
             # 记录文件
             rel_path = os.path.relpath(note.file, self.knowledge_dir)
@@ -178,30 +198,37 @@ class MetaIndexGenerator:
         # 构建 markdown 内容
         lines = [
             "---",
-            f"created: {datetime.now().strftime('%Y-%m-%d')}",
             "type: index",
-            "tags: [索引]",
+            'tags: ["索引"]',
             "---",
             "",
             "# 发行人索引",
             "",
+        ]
+
+        # 发行索引表：发行人 | 标签 | 发行条款 | 概况 | 资金运用 | 主营业务 | 资产结构
+        lines.extend([
             "## 索引表",
             "",
-            "| 发行人 | 债券类型 | 概况 |",
-            "|--------|---------|------|"
-        ]
+            "| 发行人 | 标签 | 发行条款 | 概况 | 资金运用 | 主营业务 | 资产结构 |",
+            "|--------|------|---------|------|---------|---------|---------|",
+        ])
 
         # 按发行人名称排序
         for issuer in sorted(issuers.keys()):
             info = issuers[issuer]
             tags = '、'.join(sorted(info['tags']))
 
-            profile_link = ""
-            if "03-发行人基本情况" in info['files']:
-                rel_path = info['files']["03-发行人基本情况"]
-                profile_link = f"[概况](../{rel_path})"
+            cells = []
+            for dir_name, _ in NOTE_DIR_MAP:
+                if dir_name in info['files']:
+                    rel_path = info['files'][dir_name]
+                    display_name = DIR_DISPLAY.get(dir_name, dir_name)
+                    cells.append(f"[{display_name}](../{rel_path})")
+                else:
+                    cells.append("—")
 
-            lines.append(f"| {issuer} | {tags} | {profile_link} |")
+            lines.append(f"| {issuer} | {tags} | {' | '.join(cells)} |")
 
         # 按区域统计
         lines.extend([
@@ -209,10 +236,10 @@ class MetaIndexGenerator:
             "## 按区域统计",
             "",
             "| 省份/区域 | 发行人 | 数量 |",
-            "|----------|--------|------|"
+            "|----------|--------|------|",
         ])
 
-        # 按发行人名称首字母分组（简化为按省份）
+        # 按发行人名称首字分组
         provinces: Dict[str, List[str]] = {}
         for issuer in issuers.keys():
             province = issuer[:2]
@@ -229,7 +256,7 @@ class MetaIndexGenerator:
         lines.extend([
             "",
             "---",
-            f"**更新日期**: {datetime.now().strftime('%Y-%m-%d')}"
+            f"**最后更新**: `= date(this.file.mtime)`",
         ])
 
         return '\n'.join(lines)
@@ -241,7 +268,7 @@ class MetaIndexGenerator:
         terms_dir = os.path.join(self.knowledge_dir, "01-发行条款")
 
         if os.path.exists(terms_dir):
-            for md_file in glob.glob(os.path.join(terms_dir, "*.md")):
+            for md_file in sorted(glob.glob(os.path.join(terms_dir, "*.md"))):
                 bond_info = self._parse_bond_terms(md_file)
                 if bond_info:
                     bonds.append(bond_info)
@@ -249,20 +276,22 @@ class MetaIndexGenerator:
         # 构建 markdown 内容
         lines = [
             "---",
-            f"created: {datetime.now().strftime('%Y-%m-%d')}",
             "type: index",
-            "tags: [索引]",
+            'tags: ["索引"]',
             "---",
             "",
             "# 债券索引",
             "",
+        ]
+
+        # 按债券类型统计
+        lines.extend([
             "## 按债券类型统计",
             "",
             "| 债券类型 | 数量 | 债券简称 |",
-            "|---------|------|---------|"
-        ]
+            "|---------|------|---------|",
+        ])
 
-        # 按债券类型分组
         by_type: Dict[str, List[str]] = {}
         for bond in bonds:
             bond_type = bond.bond_type or '公司债'
@@ -282,7 +311,7 @@ class MetaIndexGenerator:
             "### 按发行年份统计",
             "",
             "| 年份 | 数量 | 债券简称 |",
-            "|------|------|---------|"
+            "|------|------|---------|",
         ])
 
         by_year: Dict[str, List[str]] = {}
@@ -295,7 +324,7 @@ class MetaIndexGenerator:
         for year in sorted(by_year.keys()):
             bond_list = by_year[year]
             lines.append(
-                f"| {year} | {len(bond_list)} | {'、'.join(bond_list)} |"
+                f"| {year}年 | {len(bond_list)} | {'、'.join(bond_list)} |"
             )
 
         # 按增信方式统计
@@ -304,7 +333,7 @@ class MetaIndexGenerator:
             "### 按增信方式统计",
             "",
             "| 增信方式 | 数量 | 债券简称 |",
-            "|---------|------|---------|"
+            "|---------|------|---------|",
         ])
 
         by_guarantee: Dict[str, List[str]] = {}
@@ -325,8 +354,8 @@ class MetaIndexGenerator:
             "",
             "## 索引表",
             "",
-            "| 债券简称 | 发行人 | 发行年份 | 发行规模 | 债券期限 | 增信方式 | 发行条款 |",
-            "|---------|--------|---------|---------|---------|---------|---------|"
+            "| 债券简称 | 发行人 | 发行年份 | 发行规模 | 债券期限 | 增信方式 | 主体评级 | 发行条款 |",
+            "|---------|--------|---------|---------|---------|---------|---------|---------|",
         ])
 
         for bond in sorted(bonds, key=lambda x: x.bond_short or ''):
@@ -335,7 +364,8 @@ class MetaIndexGenerator:
                 f"| {bond.bond_short or '/'} | {bond.issuer or '/'} | "
                 f"{bond.year or '/'} | {bond.issue_scale or '/'} | "
                 f"{bond.bond_term or '/'} | {bond.guarantee or '/'} | "
-                f"[发行条款](../{rel_path}) |"
+                f"{bond.credit_rating or '/'} | "
+                f"[条款](../{rel_path}) |"
             )
 
         # 统计摘要
@@ -351,7 +381,7 @@ class MetaIndexGenerator:
         lines.extend([
             "",
             "---",
-            f"**更新日期**: {datetime.now().strftime('%Y-%m-%d')}"
+            f"**最后更新**: `= date(this.file.mtime)`",
         ])
 
         return '\n'.join(lines)
