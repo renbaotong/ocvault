@@ -94,10 +94,10 @@ class BondTermsExtractor(BaseExtractor):
 
         if not info["register_scale"]:
             val = self.find_pattern(
-                [r"注册金额.*?(\d+)\s*亿", r"注册.*?(\d+)\s*亿"],
+                [r"注册金额.*?(\d+(?:\.\d+)?)\s*亿", r"注册.*?(\d+(?:\.\d+)?)\s*亿"],
                 cover_text
             )
-            if val:
+            if val and float(val) > 0:
                 info["register_scale"] = f"{val}亿元"
 
         if not info["issue_scale"]:
@@ -109,12 +109,12 @@ class BondTermsExtractor(BaseExtractor):
                 ],
                 cover_text
             )
-            if val:
+            if val and float(val) > 0:
                 info["issue_scale"] = f"{val}亿元"
 
         if not info["register_scale"]:
             val = self.find_pattern(BOND_TERMS_PATTERNS["register_scale"], clean)
-            if val:
+            if val and float(val) > 0:
                 # 安全验证：确认匹配的不是银行授信额度等无关内容
                 # 在匹配点附近搜索关键词，排除"授信""银行"等场景
                 for pattern in BOND_TERMS_PATTERNS["register_scale"]:
@@ -134,12 +134,12 @@ class BondTermsExtractor(BaseExtractor):
                 r'深证函.*?号.*?同意.*?发行.*?不超过.*?(\d+(?:\.\d+)?)\s*亿',
                 clean
             )
-            if match:
+            if match and float(match.group(1)) > 0:
                 info["issue_scale"] = f"{match.group(1)}亿元"
 
         if not info["issue_scale"]:
             val = self.find_pattern(BOND_TERMS_PATTERNS["issue_scale"], clean)
-            if val:
+            if val and float(val) > 0:
                 # 安全验证：排除授信/银行额度等无关内容
                 for pattern in BOND_TERMS_PATTERNS["issue_scale"]:
                     m = re.search(pattern, clean)
@@ -386,7 +386,193 @@ class BondTermsExtractor(BaseExtractor):
 
     def _extract_issue_scale(self, clean_text: str) -> str:
         """提取本期发行规模"""
-        # 模式 0：如果包含品种信息，提取品种总计
+        # 模式 0b：本期债券发行总金额/总额/总额度不超过人民币 X 亿元（优先，最可靠）
+        match = re.search(
+            r'本期债券发行总[金额规模度]*\s*不超过[人民币\s]*(\d+(?:\.\d+)?)\s*亿',
+            clean_text
+        )
+        if match:
+            return f"{match.group(1)}亿元"
+
+        # 模式 1：本期债券发行规模不超过人民币 X 亿元
+        match = re.search(
+            r'本期债券发行规模\s*不超过[人民币\s]*(\d+(?:\.\d+)?)\s*亿',
+            clean_text
+        )
+        if match:
+            return f"{match.group(1)}亿元"
+
+        # 模式 1b：本期债券发行金额不超过人民币 X 亿元
+        match = re.search(
+            r'本期债券发行金额\s*不超过[人民币\s]*(\d+(?:\.\d+)?)\s*亿',
+            clean_text
+        )
+        if match:
+            return f"{match.group(1)}亿元"
+
+        # 模式 3e：发行金额：本期债券发行总额不超过人民币 X 亿元
+        match = re.search(
+            r'发行金额[：:]\s*本期债券发行总额\s*不超过[人民币\s]*(\d+(?:\.\d+)?)\s*亿',
+            clean_text
+        )
+        if match:
+            return f"{match.group(1)}亿元"
+
+        # 模式 3d：发行规模...不超过 X 亿元（限制距离，避免跨段落匹配）
+        match = re.search(
+            r'发行规模.{0,60}不超过[人民币\s]*(\d+(?:\.\d+)?)\s*亿元',
+            clean_text
+        )
+        if match:
+            return f"{match.group(1)}亿元"
+
+        # 模式 3c：发行金额...不超过 X 亿元（限制距离）
+        match = re.search(
+            r'发行金额.{0,60}不超过[人民币\s]*(\d+(?:\.\d+)?)\s*亿元',
+            clean_text
+        )
+        if match:
+            return f"{match.group(1)}亿元"
+
+        # 模式 2：发行规模...本期债券...不超过 X 亿元（限制距离）
+        match = re.search(
+            r'发行规模.{0,200}本期债券.{0,50}不超过[人民币\s]*(\d+(?:\.\d+)?)\s*亿',
+            clean_text
+        )
+        if match:
+            return f"{match.group(1)}亿元"
+
+        # 模式 3：发行规模...不超过 X 亿元（含 X 亿元）
+        match = re.search(
+            r'发行规模.{0,60}不超过[人民币\s]*(\d+(?:\.\d+)?)\s*亿元[？(（] 含',
+            clean_text
+        )
+        if match:
+            return f"{match.group(1)}亿元"
+
+        # 模式 3b：发行金额...不超过 X 亿元（含 X 亿元）
+        match = re.search(
+            r'发行金额.{0,60}不超过[人民币\s]*(\d+(?:\.\d+)?)\s*亿元[？(（] 含',
+            clean_text
+        )
+        if match:
+            return f"{match.group(1)}亿元"
+
+        # 模式 2：本期/本次债券面值总额不超过 X 亿元（含 X 亿元）
+        match = re.search(
+            r'(?:本期|本次) 债券面值总额\s*不超过[人民币\s]*(\d+(?:\.\d+)?)\s*亿.*?[（(] 含',
+            clean_text
+        )
+        if match:
+            return f"{match.group(1)}亿元"
+
+        # 模式 2b：本期/本次债券发行总额不超过 X 亿元（含 X 亿元）
+        match = re.search(
+            r'(?:本期|本次) 债券发行总额\s*不超过[人民币\s]*(\d+(?:\.\d+)?)\s*亿元[？(（] 含',
+            clean_text
+        )
+        if match:
+            return f"{match.group(1)}亿元"
+
+        # 模式 3：本期/本次债券发行规模为 X 亿元
+        match = re.search(
+            r'(?:本期|本次) 债券发行规模.{0,50}为\s*(?:人民币\s*)?(\d+(?:\.\d+)?)\s*亿',
+            clean_text
+        )
+        if match:
+            return f"{match.group(1)}亿元"
+
+        # 模式 4：本期/本次债券发行总额为 X 亿元
+        match = re.search(
+            r'(?:本期|本次) 债券发行总额.{0,50}为\s*(?:人民币\s*)?(\d+(?:\.\d+)?)\s*亿',
+            clean_text
+        )
+        if match:
+            return f"{match.group(1)}亿元"
+
+        # 模式 5：本期/本次债券发行规模/总额不超过 X 亿元
+        match = re.search(
+            r'(?:本期|本次) 债券发行\s*(?:规模|总额).{0,50}不超过[人民币\s]*(\d+(?:\.\d+)?)\s*亿',
+            clean_text
+        )
+        if match:
+            return f"{match.group(1)}亿元"
+
+        # 模式 5b：本期/本次债券发行总额不超过 X 亿元
+        match = re.search(
+            r'(?:本期|本次) 债券发行总额\s*不超过[人民币\s]*(\d+(?:\.\d+)?)\s*亿',
+            clean_text
+        )
+        if match:
+            return f"{match.group(1)}亿元"
+
+        # 模式 5c：本期/本次债券发行金额不超过 X 亿元
+        match = re.search(
+            r'(?:本期|本次) 债券发行金额.{0,50}不超过[人民币\s]*(\d+(?:\.\d+)?)\s*亿',
+            clean_text
+        )
+        if match:
+            return f"{match.group(1)}亿元"
+
+        # 模式 6：本期/本次债券发行...为 X 亿元
+        match = re.search(
+            r'(?:本期|本次) 债券发行.{0,50}为\s*(?:人民币\s*)?(\d+(?:\.\d+)?)\s*亿',
+            clean_text
+        )
+        if match:
+            return f"{match.group(1)}亿元"
+
+        # 模式 7：本期/本次债券发行规模不超过 X 亿元
+        match = re.search(
+            r'(?:本期|本次) 债券发行规模.{0,50}不超过[人民币\s]*(\d+(?:\.\d+)?)\s*亿',
+            clean_text
+        )
+        if match:
+            return f"{match.group(1)}亿元"
+
+        # 模式 8：发行规模/发行金额：本期/本次债券...X 亿元
+        match = re.search(
+            r'发行\s*(?:规模|金额)[：:]\s*(?:本期|本次) 债券.{0,50}不超过[人民币\s]*(\d+(?:\.\d+)?)\s*亿',
+            clean_text
+        )
+        if match:
+            return f"{match.group(1)}亿元"
+
+        # 模式 9：发行规模/发行金额...不超过 X 亿元
+        match = re.search(
+            r'发行\s*(?:规模|金额)[：:].{0,60}不超过[人民币\s]*(\d+(?:\.\d+)?)\s*亿',
+            clean_text
+        )
+        if match:
+            return f"{match.group(1)}亿元"
+
+        # 模式 10：本期/本次债券...规模 X 亿元
+        match = re.search(
+            r'(?:本期|本次) 债券发行规模.{0,50}(\d+(?:\.\d+)?)\s*亿',
+            clean_text
+        )
+        if match:
+            return f"{match.group(1)}亿元"
+
+        # 模式 11：本期发行 X 亿元
+        match = re.search(
+            r'本期发行\s*[债面额]*[总规模]*[：:]?\s*(\d+(?:\.\d+)?)\s*亿',
+            clean_text
+        )
+        if match:
+            return f"{match.group(1)}亿元"
+
+        # 模式 12：直接匹配"XX 债券发行规模不超过 X 亿元"
+        match = re.search(
+            r'债券发行规模\s*不超过[人民币\s]*(\d+(?:\.\d+)?)\s*亿',
+            clean_text
+        )
+        if match:
+            return f"{match.group(1)}亿元"
+
+        # ====== 以下是有品种（多品种）债券的提取逻辑 ======
+        # 放在后面，因为上面的通用模式可能更精确
+
         if '品种一' in clean_text or '品种二' in clean_text:
             # 查找品种总计（限制品种和合计之间的距离，避免跨段落匹配）
             match = re.search(
@@ -401,209 +587,25 @@ class BondTermsExtractor(BaseExtractor):
                 clean_text
             )
             if match:
-                # 返回第一个数字（总规模）
                 return f"{match.group(1)}亿元"
-            # 查找"品种一...X 亿元；品种二...Y 亿元"
-            match = re.search(
-                r'品种一.{0,100}(\d+(?:\.\d+)?)\s*亿.*?品种二.{0,100}(\d+(?:\.\d+)?)\s*亿',
-                clean_text
-            )
-            if match:
-                # 返回总计
-                total = float(match.group(1)) + float(match.group(2))
-                return f"{total}亿元"
             # 查找"品种一发行规模为不超过（含）X 亿元；品种二发行规模为不超过（含）Y 亿元"
+            # （限制品种名称与金额之间的距离，避免捕获无关数字）
             match = re.search(
-                r'品种一发行规模.*?不超过.*?(\d+(?:\.\d+)?)\s*亿.{0,200}品种二发行规模.*?不超过.*?(\d+(?:\.\d+)?)\s*亿',
+                r'品种一.{0,50}发行规模.*?不超过.*?(\d+(?:\.\d+)?)\s*亿.{0,200}品种二.{0,50}发行规模.*?不超过.*?(\d+(?:\.\d+)?)\s*亿',
                 clean_text
             )
             if match:
                 total = float(match.group(1)) + float(match.group(2))
                 return f"{total}亿元"
-
-        # 模式 0b：本期债券发行总金额不超过人民币 X 亿元（适配乱码 PDF）
-        match = re.search(
-            r'本期债券发行总[金额规模]*不超过.*?(\d+(?:\.\d+)?)\s*亿',
-            clean_text
-        )
-        if match:
-            return f"{match.group(1)}亿元"
-
-        # 模式 1：本期债券发行规模不超过人民币 X 亿元（优先匹配"本期债券发行规模"）
-        match = re.search(
-            r'本期债券发行规模不超过.*?(\d+(?:\.\d+)?)\s*亿',
-            clean_text
-        )
-        if match:
-            return f"{match.group(1)}亿元"
-
-        # 模式 1b：本期债券发行金额不超过人民币 X 亿元
-        match = re.search(
-            r'本期债券发行金额不超过.*?(\d+(?:\.\d+)?)\s*亿',
-            clean_text
-        )
-        if match:
-            return f"{match.group(1)}亿元"
-
-        # 模式 2：发行规模...本期债券...不超过 X 亿元
-        match = re.search(
-            r'发行规模.*?本期债券.*?不超过.*?(\d+(?:\.\d+)?)\s*亿',
-            clean_text
-        )
-        if match:
-            return f"{match.group(1)}亿元"
-
-        # 模式 3：发行规模...X 亿元（含 X 亿元）
-        match = re.search(
-            r'发行规模.{0,100}不超过.*?(\d+(?:\.\d+)?)\s*亿元？（含',
-            clean_text
-        )
-        if match:
-            return f"{match.group(1)}亿元"
-
-        # 模式 3b：发行金额...X 亿元（含 X 亿元）
-        match = re.search(
-            r'发行金额.{0,100}不超过.*?(\d+(?:\.\d+)?)\s*亿元？（含',
-            clean_text
-        )
-        if match:
-            return f"{match.group(1)}亿元"
-
-        # 模式 3c：发行金额...不超过 X 亿元
-        match = re.search(
-            r'发行金额.{0,100}不超过.*?(\d+(?:\.\d+)?)\s*亿元',
-            clean_text
-        )
-        if match:
-            return f"{match.group(1)}亿元"
-
-        # 模式 3d：发行规模...不超过 X 亿元
-        match = re.search(
-            r'发行规模.{0,100}不超过.*?(\d+(?:\.\d+)?)\s*亿元',
-            clean_text
-        )
-        if match:
-            return f"{match.group(1)}亿元"
-
-        # 模式 3e：发行金额：本期债券发行总额不超过人民币 X 亿元（含 X 亿元）
-        match = re.search(
-            r'发行金额[：:].{0,50}本期债券发行总额.{0,30}不超过.{0,10}(\d+(?:\.\d+)?)\s*亿',
-            clean_text
-        )
-        if match:
-            return f"{match.group(1)}亿元"
-
-        # 模式 2：本期/本次债券面值总额不超过 X 亿元（含 X 亿元）
-        match = re.search(
-            r'(?:本期 | 本次) 债券面值总额.*?不超过.*?(\d+(?:\.\d+)?)\s*亿.*?[（(] 含',
-            clean_text
-        )
-        if match:
-            return f"{match.group(1)}亿元"
-
-        # 模式 2b：本期/本次债券发行总额不超过 X 亿元（含 X 亿元）
-        match = re.search(
-            r'(?:本期 | 本次) 债券发行总额.*?不超过.*?(\d+(?:\.\d+)?)\s*亿元？（含',
-            clean_text
-        )
-        if match:
-            return f"{match.group(1)}亿元"
-
-        # 模式 3：本期/本次债券发行规模为 X 亿元
-        match = re.search(
-            r'(?:本期 | 本次) 债券发行规模.{0,50}为 (?:人民币)?\s*(\d+(?:\.\d+)?)\s*亿',
-            clean_text
-        )
-        if match:
-            return f"{match.group(1)}亿元"
-
-        # 模式 4：本期/本次债券发行总额为 X 亿元
-        match = re.search(
-            r'(?:本期 | 本次) 债券发行总额.{0,50}为 (?:人民币)?\s*(\d+(?:\.\d+)?)\s*亿',
-            clean_text
-        )
-        if match:
-            return f"{match.group(1)}亿元"
-
-        # 模式 5：本期/本次债券发行规模/总额不超过 X 亿元
-        match = re.search(
-            r'(?:本期 | 本次) 债券发行 (?:规模 | 总额).{0,50}不超过.*?(\d+(?:\.\d+)?)\s*亿',
-            clean_text
-        )
-        if match:
-            return f"{match.group(1)}亿元"
-
-        # 模式 5b：本期/本次债券发行总额不超过 X 亿元
-        match = re.search(
-            r'(?:本期 | 本次) 债券发行总额不超过.*?(\d+(?:\.\d+)?)\s*亿',
-            clean_text
-        )
-        if match:
-            return f"{match.group(1)}亿元"
-
-        # 模式 5c：本期/本次债券发行金额不超过 X 亿元
-        match = re.search(
-            r'(?:本期 | 本次) 债券发行金额.{0,50}不超过.*?(\d+(?:\.\d+)?)\s*亿',
-            clean_text
-        )
-        if match:
-            return f"{match.group(1)}亿元"
-
-        # 模式 6：本期/本次债券发行...为 X 亿元
-        match = re.search(
-            r'(?:本期 | 本次) 债券发行.{0,50}为 (?:人民币)?\s*(\d+(?:\.\d+)?)\s*亿',
-            clean_text
-        )
-        if match:
-            return f"{match.group(1)}亿元"
-
-        # 模式 7：本期/本次债券发行规模不超过 X 亿元
-        match = re.search(
-            r'(?:本期 | 本次) 债券发行规模.{0,50}不超过.*?(\d+(?:\.\d+)?)\s*亿',
-            clean_text
-        )
-        if match:
-            return f"{match.group(1)}亿元"
-
-        # 模式 8：发行规模/发行金额：本期/本次债券...X 亿元
-        match = re.search(
-            r'发行 (?:规模 | 金额)[:：].{0,100}(?:本期 | 本次) 债券.*?不超过.*?(\d+(?:\.\d+)?)\s*亿',
-            clean_text
-        )
-        if match:
-            return f"{match.group(1)}亿元"
-
-        # 模式 9：发行规模/发行金额...不超过 X 亿元
-        match = re.search(
-            r'发行 (?:规模 | 金额)[:：].{0,100}不超过.*?(\d+(?:\.\d+)?)\s*亿',
-            clean_text
-        )
-        if match:
-            return f"{match.group(1)}亿元"
-
-        # 模式 10：本期/本次债券...规模 X 亿元
-        match = re.search(
-            r'(?:本期 | 本次) 债券发行规模.{0,50}.*?(\d+(?:\.\d+)?)\s*亿',
-            clean_text
-        )
-        if match:
-            return f"{match.group(1)}亿元"
-
-        # 模式 11：本期发行 X 亿元
-        match = re.search(
-            r'本期发行 [债面额]*[总规模]*[:：]?\s*(\d+(?:\.\d+)?)\s*亿',
-            clean_text
-        )
-        if match:
-            return f"{match.group(1)}亿元"
-
-        # 模式 12：直接匹配"XX 债券发行规模不超过 X 亿元"（南通格式）
-        match = re.search(
-            r'债券发行规模不超过.*?(\d+(?:\.\d+)?)\s*亿',
-            clean_text
-        )
-        if match:
-            return f"{match.group(1)}亿元"
+            # 查找"品种一...X 亿元；品种二...Y 亿元"
+            # （同上，限制距离并限定"发行规模"关键词）
+            match = re.search(
+                r'品种一发行规模.{0,50}(\d+(?:\.\d+)?)\s*亿.{0,200}品种二发行规模.{0,50}(\d+(?:\.\d+)?)\s*亿',
+                clean_text
+            )
+            if match:
+                total = float(match.group(1)) + float(match.group(2))
+                return f"{total}亿元"
 
         return ""
 
