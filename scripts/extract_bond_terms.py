@@ -59,9 +59,32 @@ class BondTermsExtractor(BaseExtractor):
         # 先提取注册规模（注册规模是固定的，不超过此值）
         info["register_scale"], info["approval_letter"] = self._extract_register_scale(clean)
 
-        # 优先在章节范围内提取本期发行规模，如果章节文本太短则回退到全文
-        search_text = section_text if len(section_text) > 500 else clean
+        # 如果注册规模提取成功但没有获取到函号，尝试独立提取函号
+        if info["register_scale"] and not info["approval_letter"]:
+            letter_match = re.search(r'(?:[上深]|.{0,3})证函[^号]*号', clean)
+            if letter_match:
+                info["approval_letter"] = letter_match.group(0)
+            else:
+                letter_match = re.search(r'证函[^号]*号', clean)
+                if letter_match:
+                    info["approval_letter"] = letter_match.group(0)
+
+        # 如果注册规模未提取到但存在函号，仍应记录函号
+        if not info["register_scale"]:
+            letter_match = re.search(r'(?:[上深]|.{0,3})证函[^号]*号', clean)
+            if letter_match:
+                info["approval_letter"] = letter_match.group(0)
+            else:
+                letter_match = re.search(r'证函[^号]*号', clean)
+                if letter_match:
+                    info["approval_letter"] = letter_match.group(0)
+
+        # 优先在章节范围内提取本期发行规模，如果章节文本太短或未找到则回退到全文
+        search_text = section_text if len(section_text) > 5000 else clean
         info["issue_scale"] = self._extract_issue_scale(search_text)
+        # 如果在限定范围内未找到，尝试全文
+        if not info["issue_scale"] and search_text != clean:
+            info["issue_scale"] = self._extract_issue_scale(clean)
 
         if info["bond_varieties"]:
             # 如果有多品种信息，优先使用品种总计
@@ -92,7 +115,19 @@ class BondTermsExtractor(BaseExtractor):
         if not info["register_scale"]:
             val = self.find_pattern(BOND_TERMS_PATTERNS["register_scale"], clean)
             if val:
-                info["register_scale"] = f"{val}亿元"
+                # 安全验证：确认匹配的不是银行授信额度等无关内容
+                # 在匹配点附近搜索关键词，排除"授信""银行"等场景
+                for pattern in BOND_TERMS_PATTERNS["register_scale"]:
+                    m = re.search(pattern, clean)
+                    if m:
+                        context = clean[max(0, m.start() - 100):m.start()]
+                        if '授信' not in context and '银行' not in context:
+                            info["register_scale"] = f"{val}亿元"
+                            break
+                        else:
+                            self._logger.warning(
+                                f"register_scale 匹配到授信/银行相关内容({val}亿)，已跳过"
+                            )
 
         if not info["issue_scale"]:
             match = re.search(
@@ -105,7 +140,18 @@ class BondTermsExtractor(BaseExtractor):
         if not info["issue_scale"]:
             val = self.find_pattern(BOND_TERMS_PATTERNS["issue_scale"], clean)
             if val:
-                info["issue_scale"] = f"{val}亿元"
+                # 安全验证：排除授信/银行额度等无关内容
+                for pattern in BOND_TERMS_PATTERNS["issue_scale"]:
+                    m = re.search(pattern, clean)
+                    if m:
+                        context = clean[max(0, m.start() - 100):m.start()]
+                        if '授信' not in context and '银行' not in context:
+                            info["issue_scale"] = f"{val}亿元"
+                            break
+                        else:
+                            self._logger.warning(
+                                f"issue_scale 匹配到授信/银行相关内容({val}亿)，已跳过"
+                            )
 
         # 校验：本期发行规模不应超过注册规模，且应在合理范围（1-15亿）
         if info["register_scale"] and info["issue_scale"]:
@@ -197,9 +243,10 @@ class BondTermsExtractor(BaseExtractor):
             letter = letter_match.group(0) if letter_match else "已获取无异议函"
             return f"{match.group(1)}亿元", letter
 
-        # 模式2：无异议函...上证函/深证函号...注册总额为人民币 X 亿元
+        # 模式2b：无异议函...上证函/深证函号...注册金额为/注册总额为...人民币 X 亿元
+        # （比模式2宽松，同时匹配"注册金额"和"注册总额"）
         match = re.search(
-            r'无异议函.*?[上深]证函.*?号.*?注册总额为.*?人民币.*?(\d+(?:\.\d+)?)\s*亿',
+            r'无异议函.*?[上深]证函.*?号.*?注册[总金]额为.*?人民币.*?(\d+(?:\.\d+)?)\s*亿',
             clean_text
         )
         if match and float(match.group(1)) > 0:
@@ -215,6 +262,27 @@ class BondTermsExtractor(BaseExtractor):
         if match and float(match.group(1)) > 0:
             letter_match = re.search(r'[上深]证函.*?号', clean_text)
             letter = letter_match.group(0) if letter_match else "已获取无异议函"
+            return f"{match.group(1)}亿元", letter
+
+        # 模式3a：上证函/深证函...号...注册金额为...X 亿元
+        match = re.search(
+            r'[上深]证函.*?号.*?注册金额为.*?(\d+(?:\.\d+)?)\s*亿',
+            clean_text
+        )
+        if match and float(match.group(1)) > 0:
+            letter_match = re.search(r'[上深]证函.*?号', clean_text)
+            letter = letter_match.group(0) if letter_match else "已获取无异议函"
+            return f"{match.group(1)}亿元", letter
+
+        # 模式3b：上证函/深证函...号...注...X 亿元（宽松模式，适配 PDF 编码乱码）
+        # 在"证函...号"附近找包含"注"字的注册金额数字，限制在合理范围
+        match = re.search(
+            r'[上深]证函.{0,200}注[^\d]{0,30}?(\d+(?:\.\d+)?)\s*亿',
+            clean_text
+        )
+        if match and 0 < float(match.group(1)) <= 15:
+            letter_match = re.search(r'[上深]证函.*?号', clean_text)
+            letter = letter_match.group(0) if letter_match else ""
             return f"{match.group(1)}亿元", letter
 
         # 模式4：上证函/深证函...号...同意...不超过...（限制范围，业务规则：不超过15亿）
@@ -320,9 +388,9 @@ class BondTermsExtractor(BaseExtractor):
         """提取本期发行规模"""
         # 模式 0：如果包含品种信息，提取品种总计
         if '品种一' in clean_text or '品种二' in clean_text:
-            # 查找品种总计
+            # 查找品种总计（限制品种和合计之间的距离，避免跨段落匹配）
             match = re.search(
-                r'品种.*?合计.*?(\d+(?:\.\d+)?)\s*亿',
+                r'品种[一二].{0,200}合计.*?(\d+(?:\.\d+)?)\s*亿',
                 clean_text
             )
             if match:
@@ -337,7 +405,7 @@ class BondTermsExtractor(BaseExtractor):
                 return f"{match.group(1)}亿元"
             # 查找"品种一...X 亿元；品种二...Y 亿元"
             match = re.search(
-                r'品种一.*?(\d+(?:\.\d+)?)\s*亿.*?品种二.*?(\d+(?:\.\d+)?)\s*亿',
+                r'品种一.{0,100}(\d+(?:\.\d+)?)\s*亿.*?品种二.{0,100}(\d+(?:\.\d+)?)\s*亿',
                 clean_text
             )
             if match:
@@ -346,12 +414,20 @@ class BondTermsExtractor(BaseExtractor):
                 return f"{total}亿元"
             # 查找"品种一发行规模为不超过（含）X 亿元；品种二发行规模为不超过（含）Y 亿元"
             match = re.search(
-                r'品种一发行规模.*?不超过.*?(\d+(?:\.\d+)?)\s*亿.*?品种二发行规模.*?不超过.*?(\d+(?:\.\d+)?)\s*亿',
+                r'品种一发行规模.*?不超过.*?(\d+(?:\.\d+)?)\s*亿.{0,200}品种二发行规模.*?不超过.*?(\d+(?:\.\d+)?)\s*亿',
                 clean_text
             )
             if match:
                 total = float(match.group(1)) + float(match.group(2))
                 return f"{total}亿元"
+
+        # 模式 0b：本期债券发行总金额不超过人民币 X 亿元（适配乱码 PDF）
+        match = re.search(
+            r'本期债券发行总[金额规模]*不超过.*?(\d+(?:\.\d+)?)\s*亿',
+            clean_text
+        )
+        if match:
+            return f"{match.group(1)}亿元"
 
         # 模式 1：本期债券发行规模不超过人民币 X 亿元（优先匹配"本期债券发行规模"）
         match = re.search(

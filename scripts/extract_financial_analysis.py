@@ -878,7 +878,7 @@ class FinancialAnalysisExtractor(BaseExtractor):
 """
         output_path = os.path.join(
             output_base, self.OUTPUT_DIR,
-            f"{info['issuer']}- 资产结构分析.md"
+            f"{info['issuer']}-资产结构分析.md"
         )
         self.write_note(output_path, template)
         return output_path
