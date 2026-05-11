@@ -35,7 +35,14 @@
       "Bash(PYTHONIOENCODING=utf-8 python -u scripts/extract_issuer_profile.py)",
       "Bash(PYTHONIOENCODING=utf-8 python -u scripts/extract_business_analysis.py)",
       "Bash(PYTHONIOENCODING=utf-8 python -u scripts/extract_financial_analysis.py)",
-      "Bash(PYTHONIOENCODING=utf-8 python scripts/generate_meta_index.py)"
+      "Bash(PYTHONIOENCODING=utf-8 python scripts/generate_meta_index.py)",
+      "Bash(rmdir \"C:/Users/baotong/ideas/ocvault/01-发行条款/\")",
+      "Bash(rmdir \"C:/Users/baotong/ideas/ocvault/03-发行人基本情况/\")",
+      "Bash(xxd)",
+      "Bash(cat \"05-资产结构分析/鹤壁恒源矿业集团有限公司- 资产结构分析.md\")",
+      "Bash(cat \"05-资产结构分析/湖北水利发展集团有限公司- 资产结构分析.md\")",
+      "Bash(cat \"05-资产结构分析/衢州市信安能源有限公司- 资产结构分析.md\")",
+      "Bash(PYTHONIOENCODING=utf-8 python scripts/debug_all_equity.py)"
     ]
   }
 }
