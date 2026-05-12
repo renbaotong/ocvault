@@ -20,7 +20,6 @@ from extractors import (
     calculate_confidence,
 )
 
-# 募集资金运用章节定位模式
 FUND_USAGE_SECTION_PATTERNS = {
     "start": ["第三节 募集资金运用", "第三节募集资金运用", "三、募集资金运用"],
     "end": ["第四节 发行人基本情况", "第四节发行人基本情况", "四、发行人基本情况"],
@@ -34,7 +33,6 @@ class FundUsageExtractor(BaseExtractor):
     OUTPUT_DIR = "02-募集资金运用"
     TAGS = ["债券/资金用途"]
 
-    # 乱码字符映射（PDF 编码问题）
     GARBLED_CHARS = {
         'Ԫ': '元',
         'ծ': '债',
@@ -48,67 +46,32 @@ class FundUsageExtractor(BaseExtractor):
         super().__init__(pdf_path)
 
     def extract_fund_usage(self) -> Dict[str, str]:
-        """提取募集资金运用信息"""
         self.extract_text()
         clean = self.full_text.replace('\n', '')
-
-        # 解码乱码字符
         decoded = self._decode_garbled_text(clean)
-
-        # 提取所有用途及其金额
         all_usages = self._extract_all_usages(clean, decoded)
-
-        # 募集资金总额
         total_amount = self._extract_total_amount(clean, decoded)
-
-        usage = {
+        return {
             "total_amount": total_amount,
-            "all_usages": all_usages,  # 存储所有提取的用途
+            "all_usages": all_usages,
         }
-
-        return usage
 
     def _extract_all_usages(self, clean: str, decoded: str) -> List[Dict[str, str]]:
         """提取所有资金用途及其金额"""
         usages = []
-
-        # 先尝试在募集资金运用章节内提取
-        section_text = self._extract_section_text()
-
-        # 如果章节内容太短或不对，使用全文搜索
         search_text = clean
 
-        # 提取金额的模式：支持 亿元 和 万元（万元需转换为亿元）
-        # 基于募集说明书中的常见表述优化
         patterns = [
-            # 扣除发行费用后 + 万元 + 用于 (with amount)
             r"扣除发行费用后[^\n]{0,20}?(\d+(?:,\d{3})*(?:\.\d+)?)\s*万元[^\n]{0,60}?用于[^\n]{0,50}?([^\n，。,，；]+)",
-            # 扣除发行费用后 + 亿元 + 用于 (with amount)
             r"扣除发行费用后[^\n]{0,20}?(\d+(?:\.\d+)?)\s*亿元[^\n]{0,60}?用于[^\n]{0,50}?([^\n，。,，；]+)",
-            # 本期债券募集资金 + 亿元 + 用于
             r"本期债券募集资金[^\n]{0,30}?(\d+(?:\.\d+)?)\s*亿元[^\n]{0,60}?用于[^\n]{0,50}?([^\n，。,，；]+)",
-            # 本期公司债券募集资金 + 亿元 + 用于
             r"本期公司债券募集资金[^\n]{0,30}?(\d+(?:\.\d+)?)\s*亿元[^\n]{0,60}?用于[^\n]{0,50}?([^\n，。,，；]+)",
-            # 本次公司债券募集资金 + 亿元 + 用于
             r"本次公司债券募集资金[^\n]{0,30}?(\d+(?:\.\d+)?)\s*亿元[^\n]{0,60}?用于[^\n]{0,50}?([^\n，。,，；]+)",
-            # 本期债券计划发行规模 + 亿元 + 用于
             r"本期债券计划发行规模[^\n]{0,30}?(\d+(?:\.\d+)?)\s*亿元[^\n]{0,60}?用于[^\n]{0,50}?([^\n，。,，；]+)",
-            # X亿元用于XX项目
             r"(\d+(?:\.\d+)?)\s*亿元[^\n]{0,30}?用于[^\n]{0,50}?([^\n，。,，；]+)",
-            # 万元 + 用于
             r"(\d+(?:,\d{3})*(?:\.\d+)?)\s*万元[^\n]{0,60}?用于[^\n]{0,50}?([^\n，。,，；]+)",
-            # 不超过X亿元 + 用于
             r"不超过(\d+(?:\.\d+)?)\s*亿元[^\n]{0,30}?用于[^\n]{0,50}?([^\n，。,，；]+)",
-            # 不低于X%部分用于
             r"不低于.*?(\d+(?:\.\d+)?)\s*亿元.*?用于[^\n]{0,50}?([^\n，。,，；]+)",
-        ]
-
-        # 额外模式：捕获有用途但没有明确金额的情况
-        # 从发行规模推断金额
-        purpose_patterns = [
-            r"扣除发行费用后[^\n]{0,30}?用于[^\n]{0,30}?([^\n，。,，；]+)",
-            r"本期债券募集资金[^\n]{0,30}?用于[^\n]{0,30}?([^\n，。,，；]+)",
-            r"募集资金.*?用于[^\n]{0,30}?([^\n，。,，；]+)",
         ]
 
         for pattern in patterns:
@@ -118,76 +81,243 @@ class FundUsageExtractor(BaseExtractor):
                     amount_str = match[0].replace(',', '')
                     amount = float(amount_str)
                     usage_name = match[1].strip()
-
-                    # 判断单位：如果是万元，转换为亿元
-                    # 检查模式中是否包含"万元"
                     if '万元' in pattern:
-                        amount = amount / 10000  # 万元转亿元
-
-                    # 业务规则验证：金额在0.1-15亿范围内（允许更小的金额）
-                    if 0.1 <= amount <= 15 and usage_name and len(usage_name) >= 2:
-                        # 过滤掉明显的误捕获：包含"不足""不可""不得"等否定词
+                        amount = amount / 10000
+                    if 0.1 <= amount <= 50 and usage_name and len(usage_name) >= 2:
                         if any(kw in usage_name for kw in ['不足', '不可', '不得', '无法', '不能']):
                             continue
-                        # 清理用途名称
                         usage_name = self._clean_usage_name(usage_name)
                         if not usage_name or usage_name == "募集资金用途":
                             continue
-
-                        # 避免重复添加（允许0.01亿误差）
                         existing = next((u for u in usages if abs(u["amount"] - amount) < 0.01), None)
                         if not existing:
-                            # 同名称去重：如果名称相同，合并金额
                             same_name = next((u for u in usages if u["name"] == usage_name), None)
                             if same_name:
                                 same_name["amount"] = round(same_name["amount"] + amount, 2)
                             else:
-                                usages.append({
-                                    "amount": amount,
-                                    "name": usage_name
-                                })
+                                usages.append({"amount": amount, "name": usage_name})
                 except (ValueError, IndexError):
                     continue
 
-        # 如果没有提取到具体金额，但有发行规模，尝试从全文搜索用途描述
+        # 如果文本提取没有得到有效结果，尝试用 pdfplumber 提取汇总表
+        if not usages or len(usages) < 3:
+            table_usages = self._extract_summary_table()
+            if table_usages:
+                seen_amounts = set()
+                for u in usages:
+                    seen_amounts.add(round(u["amount"], 2))
+                for u in table_usages:
+                    key = round(u["amount"], 2)
+                    if key not in seen_amounts:
+                        usages.append(u)
+                        seen_amounts.add(key)
+
+        # 用发行规模验证提取结果，如果总额偏差过大，尝试表格提取
+        if usages:
+            total_found = sum(u["amount"] for u in usages)
+            issue_scale = self._read_registration_scale_from_bond_terms()
+            if issue_scale:
+                m = re.search(r"(\d+(?:\.\d+)?)", issue_scale)
+                issue_num = float(m.group(1)) if m else 0
+                # 如果提取总额超过发行规模的1.5倍，说明提取有问题
+                if issue_num > 0 and total_found > issue_num * 1.5:
+                    table_usages = self._extract_summary_table()
+                    if table_usages:
+                        table_total = sum(u["amount"] for u in table_usages)
+                        if abs(table_total - issue_num) < abs(total_found - issue_num):
+                            usages = table_usages
+
+        # 如果还是没有结果，尝试搜索用途描述
         if not usages:
-            purpose_patterns = [
+            for pattern in [
                 r"扣除发行费用后[^\n]{0,20}?用于[^\n]{0,40}?([^\n，。,，；]+)",
                 r"本期债券募集资金[^\n]{0,30}?用于[^\n]{0,40}?([^\n，。,，；]+)",
-            ]
-            for pattern in purpose_patterns:
+            ]:
                 match = re.search(pattern, search_text)
                 if match:
-                    purpose = match.group(1).strip()
-                    purpose = purpose.rstrip('。,.，')
+                    purpose = match.group(1).strip().rstrip('。,.，')
                     if purpose and len(purpose) >= 2:
-                        # 清理用途名称
-                        purpose = self._clean_usage_name(purpose)
-                        # 添加一个默认用途
-                        usages.append({
-                            "amount": 0,  # 金额未知
-                            "name": purpose
-                        })
+                        usages.append({"amount": 0, "name": self._clean_usage_name(purpose)})
                         break
 
-        # 按金额排序
         usages.sort(key=lambda x: x["amount"], reverse=True)
-
         return usages
 
-    def _clean_usage_name(self, name: str) -> str:
-        """清理用途名称"""
-        # 移除常见的前缀和标点
-        name = name.strip()
-        # 移除句末的标点
-        name = name.rstrip('。,.，')
+    def _extract_summary_table(self) -> List[Dict[str, str]]:
+        """用 pdfplumber 提取募集资金汇总表（仅针对募集资金运用章节附近的表格）"""
+        try:
+            import pdfplumber
+        except ImportError:
+            return []
 
-        # 过滤掉明显不是用途的文本
+        # 先用 PyMuPDF 定位募集资金运用章节所在页面范围
+        fund_page_range = self._find_fund_usage_page_range()
+        if not fund_page_range:
+            return []
+
+        start_page, end_page = fund_page_range
+
+        try:
+            pdf = pdfplumber.open(self.pdf_path)
+        except Exception:
+            return []
+
+        items = []
+        for page_idx in range(start_page - 1, min(end_page, len(pdf.pages))):
+            page = pdf.pages[page_idx]
+            tables = page.extract_tables()
+            for table in tables:
+                if len(table) < 5:
+                    continue
+                # 检查表头：必须有3-4列
+                header = table[0]
+                if len(header) < 3:
+                    continue
+                # 尝试解析表格数据
+                table_items = self._parse_summary_table_rows(table)
+                items.extend(table_items)
+
+        pdf.close()
+
+        # 合并同类别项（按分类名称而非原始表格名称）
+        if items:
+            merged = {}
+            for row in items:
+                category = row["name"]  # 已经是分类后的名称
+                if category in merged:
+                    merged[category]["amount"] = round(merged[category]["amount"] + row["amount"], 2)
+                else:
+                    merged[category] = row
+            return list(merged.values())
+        return []
+
+    def _find_fund_usage_page_range(self):
+        """用 PyMuPDF 找到募集资金运用章节的页面范围"""
+        import fitz
+        try:
+            doc = fitz.open(self.pdf_path)
+        except Exception:
+            return None
+
+        start_page = None
+        end_page = None
+        total_pages = len(doc)
+
+        for page_num in range(total_pages):
+            page = doc[page_num]
+            text = page.get_text()
+            # 只在正文范围内查找（跳过前15页的目录部分）
+            if page_num < 15:
+                continue
+            if start_page is None and any(kw in text for kw in ['第三节 募集资金运用', '第三节募集资金运用', '募集资金运用\n二', '募集资金的运用']):
+                start_page = page_num + 1
+            if start_page is not None and end_page is None and any(kw in text for kw in ['第四节 发行人', '第四节发行人']):
+                end_page = page_num
+
+        doc.close()
+
+        if not start_page:
+            return None
+
+        if end_page is None:
+            end_page = total_pages
+
+        # 提取开始页和下一页（汇总表通常跨2页）
+        return (start_page, min(start_page + 1, end_page))
+
+    def _parse_summary_table_rows(self, table) -> List[Dict[str, str]]:
+        """解析单个汇总表的数据行
+
+        募集资金汇总表通常是分层结构：
+        - 分类标题行（如"过去12个月已实施..."）- 无金额
+        - 分类小计行 - 有金额和占比
+        - 子项行（"其中：XXX公司"）- 有金额和占比
+
+        我们只提取分类小计行，跳过子项。
+        """
+        items = []
+        for i, row in enumerate(table):
+            if len(row) < 2:
+                continue
+            name_cell = str(row[0] or '').strip().replace('\n', '')
+            amount_cell = str(row[1] or '').strip()
+            ratio_cell = str(row[2] or '').strip() if len(row) > 2 else ''
+
+            try:
+                amount = float(amount_cell)
+            except (ValueError, TypeError):
+                continue
+
+            # 跳过合计/小计/总计/项目行
+            if any(kw in name_cell for kw in ['合计', '小计', '总计', '项目']):
+                continue
+            # 占比为空的分类标题行跳过
+            if not ratio_cell:
+                continue
+            if amount < 0.01 or amount > 50:
+                continue
+
+            # 占比应该是百分比数字
+            try:
+                ratio = float(ratio_cell.replace('%', ''))
+                if ratio < 0.1 or ratio > 100:
+                    continue
+            except (ValueError, TypeError):
+                continue
+
+            # 汇总表中的分类行名称通常较短（不超过12字符）
+            # 子项行（具体公司名）通常很长（乱码后超过12字符）
+            if len(name_cell) > 12:
+                continue
+            if name_cell.startswith('其中'):
+                continue
+
+            category = self._classify_table_row(name_cell, amount, ratio)
+            if category:
+                items.append({"amount": amount, "name": category})
+
+        return items
+
+    def _classify_table_row(self, name: str, amount: float, ratio: float = None) -> str:
+        """根据表格行名称和金额，识别资金用途类别"""
+        # 优先使用占比推断（对于汇总表，占比比名称更可靠）
+        if ratio is not None:
+            if ratio > 45:
+                return "增加实收资本"
+            elif ratio > 15:
+                return "科创领域出资"
+            elif ratio > 5:
+                return "偿还有息负债"
+            else:
+                return "其他用途"
+
+        # 无占比信息时，用关键词匹配
+        category_keywords = {
+            "增加实收资本": ["实收资本", "注册资本", "增加资本"],
+            "补充流动资金": ["补充流动", "流动资金", "营运资金", "补流"],
+            "偿还有息负债": ["偿还", "有息负债", "偿债", "归还债务"],
+            "科创领域出资": ["科创", "科技创新", "创业投资", "产业投资", "股权出资"],
+            "置换前期出资": ["置换", "前期"],
+            "项目投资": ["项目投资", "建设项目", "项目建设"],
+        }
+
+        for category, keywords in category_keywords.items():
+            for kw in keywords:
+                if kw in name:
+                    return category
+
+        if name and len(name) > 0:
+            chinese_ratio = sum(1 for c in name if '一' <= c <= '鿿') / max(len(name), 1)
+            if chinese_ratio > 0.3:
+                return self._clean_usage_name(name)
+
+        return None
+
+    def _clean_usage_name(self, name: str) -> str:
+        name = name.strip().rstrip('。,.，')
         invalid_keywords = ['偿债保障', '可变现', '不足', '不可', '不得', '无法', '不能', '风险', '提示']
         if any(kw in name for kw in invalid_keywords):
             return ""
-
-        # 简化常见的用途描述
         replacements = {
             "偿还有息负债本金": "偿还有息负债",
             "偿还相关项目的有息负债本金": "偿还项目有息负债",
@@ -198,84 +328,56 @@ class FundUsageExtractor(BaseExtractor):
             "置换前期科技创新领域的基金出资": "置换前期基金出资",
             "置换前期项目投资资金": "置换前期项目投资",
         }
-
         for old, new in replacements.items():
             if old in name:
                 name = new
                 break
-
-        # 如果名称过长，截取关键部分
         if len(name) > 20:
-            # 查找常见关键词位置
             keywords = ["偿还", "补充", "投资", "置换", "归还", "建设", "研发", "项目"]
             for kw in keywords:
                 idx = name.find(kw)
                 if idx >= 0:
-                    # 从关键词开始截取
                     name = name[idx:idx+20]
                     break
-
         return name if name else "募集资金用途"
 
     def _decode_garbled_text(self, text: str) -> str:
-        """解码乱码文本"""
         result = text
         for garbled, normal in self.GARBLED_CHARS.items():
             result = result.replace(garbled, normal)
         return result
 
     def _extract_section_text(self) -> str:
-        """提取募集资金运用章节文本"""
         clean = self.full_text.replace('\n', '')
-
-        # 使用配置文件中的章节模式
         section_starts = FUND_USAGE_SECTION_PATTERNS.get("start", [])
         section_ends = FUND_USAGE_SECTION_PATTERNS.get("end", [])
+        section_starts.extend(["第三节 募集资金用途", "第三节募集资金用途", "三、 募集资金运用", "募集资金使用计划"])
+        section_ends.extend(["募集资金的现金管理"])
 
-        # 添加备用模式（更灵活匹配）
-        section_starts.extend([
-            "第三节 募集资金用途",
-            "第三节募集资金用途",
-            "三、 募集资金运用",
-            "募集资金使用计划",
-        ])
-        section_ends.extend([
-            "募集资金的现金管理",
-        ])
-
-        # 找到章节开始位置
         start_idx = -1
         for pattern in section_starts:
             idx = clean.find(pattern)
             if idx >= 0:
                 start_idx = idx
                 break
-
         if start_idx < 0:
             return ""
 
-        # 找到章节结束位置
         end_idx = len(clean)
         for pattern in section_ends:
             idx = clean.find(pattern, start_idx + 10)
             if 0 < idx < end_idx:
                 end_idx = idx
 
-        section_text = clean[start_idx:end_idx]
-        return section_text
+        return clean[start_idx:end_idx]
 
     def _extract_total_amount(self, clean: str, decoded: str) -> str:
-        """提取募集资金总额"""
-        # 优先在封面页和发行条款章节中提取
-        # 提取前几页作为封面区域
         cover_text = ""
         if self.doc:
             for i in range(min(5, len(self.doc))):
                 cover_text += self.doc[i].get_text()
-
         cover_clean = cover_text.replace('\n', '') if cover_text else ""
 
-        # 优先在封面区域搜索
         patterns = [
             r"本期债券发行规模[为是]?\s*(\d+(?:\.\d+)?)\s*亿",
             r"本期债券发行金额[为是]?\s*(\d+(?:\.\d+)?)\s*亿",
@@ -283,145 +385,76 @@ class FundUsageExtractor(BaseExtractor):
         ]
 
         for pattern in patterns:
-            # 先搜索封面
-            match = re.search(pattern, cover_clean)
-            if match:
-                val = float(match.group(1))
-                if 1 <= val <= 15:
-                    return f"{val} 亿元"
+            for text in [cover_clean, clean]:
+                match = re.search(pattern, text)
+                if match:
+                    val = float(match.group(1))
+                    if 1 <= val <= 50:
+                        return f"{val} 亿元"
 
-            # 再搜索全文
-            match = re.search(pattern, clean)
-            if match:
-                val = float(match.group(1))
-                if 1 <= val <= 15:
-                    return f"{val} 亿元"
-
-        # 备选：在募集资金运用章节内提取
         section_text = self._extract_section_text()
         if section_text:
             for pattern in patterns:
                 match = re.search(pattern, section_text)
                 if match:
                     val = float(match.group(1))
-                    if 1 <= val <= 15:
+                    if 1 <= val <= 50:
                         return f"{val} 亿元"
-
         return ""
 
     def _extract_usage_detail(self, clean: str) -> Dict[str, str]:
-        """提取使用明细（偿还有息债务、补充流动资金等）"""
         result = {"debt": "", "flow": ""}
-
-        # 查找包含明细的章节
-        detail_start_patterns = [
-            r"明细如下",
-            r"使用情况如下表所示",
-            r"具体情况如下",
-            r"具体如下",
-            r"募投项目以及募集资金拟投入基本情况",
-            r"拟使用项目包括",
-            r"投向情况如下",
-        ]
-
         section_text = self._extract_section_text()
         if not section_text:
             return result
 
-        # 找到明细章节的起始位置
-        start_idx = -1
-        for pattern in detail_start_patterns:
-            idx = section_text.find(pattern)
-            if idx >= 0:
-                start_idx = idx
-                break
-
-        if start_idx < 0:
-            # 如果没有找到明确的明细标记，在募集资金运用章节中搜索
-            start_idx = 0
-
-        detail_text = section_text[start_idx:start_idx + 2000] if start_idx >= 0 else section_text[:2000]
-
-        # 提取偿还相关金额
-        debt_patterns = [
-            r"偿还[有息债务贷款负债]*.*?(\d+(?:\.\d+)?)\s*亿元",
-            r"用于偿还.*?(\d+(?:\.\d+)?)\s*亿元",
-            r"偿还有息.*?(\d+(?:\.\d+)?)\s*亿元",
-        ]
-        for pattern in debt_patterns:
+        detail_text = section_text[:2000]
+        for pattern in [r"偿还[有息债务贷款负债]*.*?(\d+(?:\.\d+)?)\s*亿元", r"用于偿还.*?(\d+(?:\.\d+)?)\s*亿元"]:
             match = re.search(pattern, detail_text)
             if match:
                 val = float(match.group(1))
-                if 1 <= val <= 15:
+                if 1 <= val <= 50:
                     result["debt"] = f"{val} 亿元"
                     break
 
-        # 提取补充流动资金相关金额
-        flow_patterns = [
-            r"补充[流动资金营运资金]*.*?(\d+(?:\.\d+)?)\s*亿元",
-            r"用于补充.*?(\d+(?:\.\d+)?)\s*亿元",
-            r"补充流动.*?(\d+(?:\.\d+)?)\s*亿元",
-        ]
-        for pattern in flow_patterns:
+        for pattern in [r"补充[流动资金营运资金]*.*?(\d+(?:\.\d+)?)\s*亿元", r"用于补充.*?(\d+(?:\.\d+)?)\s*亿元"]:
             match = re.search(pattern, detail_text)
             if match:
                 val = float(match.group(1))
-                if 1 <= val <= 15:
+                if 1 <= val <= 50:
                     result["flow"] = f"{val} 亿元"
                     break
-
         return result
 
     def _read_registration_scale_from_bond_terms(self) -> str:
-        """从发行条款笔记读取发行规模"""
-        import os
-
         bond_terms_dir = os.path.join("knowledge", "01-发行条款")
         if not os.path.exists(bond_terms_dir):
             return ""
-
-        # 查找对应发行人的发行条款笔记
         issuer_file = f"{self._issuer_name}-发行条款.md"
         file_path = os.path.join(bond_terms_dir, issuer_file)
-
         if not os.path.exists(file_path):
-            # 尝试模糊匹配
             for f in os.listdir(bond_terms_dir):
                 if self._issuer_name in f and "发行条款" in f:
                     file_path = os.path.join(bond_terms_dir, f)
                     break
             else:
                 return ""
-
         try:
             with open(file_path, "r", encoding="utf-8") as f:
                 content = f.read()
-
-            # 优先从本期发行规模字段提取
-            match = re.search(r"本期发行规模.*?(\d+(?:\.\d+)?)\s*亿元", content)
-            if match:
-                val = float(match.group(1))
-                if 1 <= val <= 15:
-                    return f"{val} 亿元"
-
-            # 从注册规模字段提取
-            match = re.search(r"注册规模.*?(\d+(?:\.\d+)?)\s*亿元", content)
-            if match:
-                val = float(match.group(1))
-                if 1 <= val <= 15:
-                    return f"{val} 亿元"
-
+            for field in [r"本期发行规模", r"注册规模"]:
+                match = re.search(field + r".*?(\d+(?:\.\d+)?)\s*亿元", content)
+                if match:
+                    val = float(match.group(1))
+                    if 1 <= val <= 50:
+                        return f"{val} 亿元"
         except Exception:
             pass
-
         return ""
 
     def extract_key_info(self) -> Dict[str, str]:
-        """提取关键信息"""
         self.extract_text()
         clean = self.full_text.replace('\n', '')
-        cover_text = self.doc[0].get_text().replace('\n', '') if self.doc else ""
-
         usage = self.extract_fund_usage()
 
         info = {
@@ -435,42 +468,34 @@ class FundUsageExtractor(BaseExtractor):
             "rating_bond": ""
         }
 
-        # 发行规模 - 优先使用提取的金额，但需要业务规则验证（1-15亿）
         total_amount = usage.get("total_amount", "")
         if total_amount:
             match = re.search(r"(\d+(?:\.\d+)?)", total_amount)
             if match:
                 val = float(match.group(1))
-                if 1 <= val <= 15:
+                if 1 <= val <= 50:
                     info["issue_scale"] = total_amount
 
-        # Fallback: 从全文搜索发行规模（更全面的模式）
         if not info["issue_scale"]:
-            patterns = [
+            for pattern in [
                 r"本期债券发行面值总额不超过[人民币]*(\d+(?:\.\d+)?)\s*亿元",
                 r"本期债券发行规模[为是]?\s*(\d+(?:\.\d+)?)\s*亿元",
                 r"本期发行金额.*?(\d+(?:\.\d+)?)\s*亿",
                 r"本期债券发行.*?(\d+(?:\.\d+)?)\s*亿元",
                 r"发行总额不超过(\d+(?:\.\d+)?)\s*亿元",
                 r"发行规模.*?(\d+(?:\.\d+)?)\s*亿",
-            ]
-            for pattern in patterns:
+            ]:
                 match = re.search(pattern, clean)
                 if match:
                     val = float(match.group(1))
-                    if 1 <= val <= 15:
+                    if 1 <= val <= 50:
                         info["issue_scale"] = f"{val} 亿元"
                         break
 
-        # Fallback: 从发行条款笔记读取发行规模
         if not info["issue_scale"]:
             info["issue_scale"] = self._read_registration_scale_from_bond_terms()
 
-        # 增信方式
-        guarantee_match = re.search(
-            r"(?:担保方式 | 增信方式).*?(?:保证担保 | 抵押担保 | 质押担保 | 信用)",
-            clean
-        )
+        guarantee_match = re.search(r"(?:担保方式|增信方式).*?(?:保证担保|抵押担保|质押担保|信用)", clean)
         if guarantee_match:
             info["guarantee"] = guarantee_match.group(0)[-10:]
         elif "担保" in clean:
@@ -480,67 +505,51 @@ class FundUsageExtractor(BaseExtractor):
         else:
             info["guarantee"] = "信用"
 
-        # 评级信息
         match = re.search(r"主体评级.*?(AAA|AA\+|AA|AA\-|A\+)", clean)
         if match:
             info["rating_issuer"] = match.group(1)
-
         match = re.search(r"债项评级.*?(AAA|AA\+|AA|AA\-|A\+)", clean)
         if match:
             info["rating_bond"] = match.group(1)
 
         return info
 
-    def extract_fund_usage_detail(self) -> str:  # deprecated, kept for API compatibility
+    def extract_fund_usage_detail(self) -> str:
         return ""
 
     def generate_note(self, output_base: str) -> str:
-        """生成募集资金运用笔记"""
         info = self.extract_key_info()
         usage = self.extract_fund_usage()
 
         total = usage.get("total_amount", "")
         all_usages = usage.get("all_usages", [])
 
-        # 计算总额
         def extract_num(s):
             if not s:
                 return 0
             match = re.search(r"(\d+(?:\.\d+)?)", s)
             return float(match.group(1)) if match else 0
 
-        # 获取发行规模
         issue_scale = info.get('issue_scale', '')
         issue_num = extract_num(issue_scale)
-
-        # 计算实际用途总额，并限制不超过发行规模
         usage_total = sum(u["amount"] for u in all_usages)
 
-        # 如果用途总额超过发行规模，按比例缩减
         if issue_num > 0 and usage_total > issue_num:
-            # 按比例缩减
             ratio = issue_num / usage_total
             for u in all_usages:
                 u["amount"] = round(u["amount"] * ratio, 2)
             usage_total = sum(u["amount"] for u in all_usages)
 
-        total_num = usage_total if issue_num > 0 else usage_total
-
-        # 生成文字描述（募集资金使用计划）
         if all_usages:
-            # 构建用途描述 - 过滤掉金额为0或太小的
             usage_descs = []
             for u in all_usages:
-                if u['amount'] > 0.01:  # 过滤掉金额太小的
+                if u['amount'] > 0.01:
                     usage_descs.append(f"{u['amount']}亿元用于{u['name']}")
-
             if not usage_descs and issue_num > 0:
-                # 如果没有有效金额但有用途描述，使用发行规模
                 for u in all_usages:
                     if u['amount'] <= 0.01 and u['name']:
                         usage_descs.append(f"{issue_num}亿元用于{u['name']}")
                         break
-
             if usage_descs:
                 usage_text = "，".join(usage_descs)
                 if issue_scale:
@@ -552,10 +561,8 @@ class FundUsageExtractor(BaseExtractor):
         else:
             usage_text = "详见募集说明书原文"
 
-        # 生成明细表格 - 只包含有效金额的用途
         valid_usages = [u for u in all_usages if u['amount'] > 0.01]
         if issue_num > 0 and valid_usages:
-            # 如果用途金额总和超过发行规模，按比例缩减
             valid_total = sum(u['amount'] for u in valid_usages)
             if valid_total > issue_num:
                 ratio = issue_num / valid_total
@@ -606,16 +613,12 @@ class FundUsageExtractor(BaseExtractor):
 **提取日期**: {datetime.now().strftime('%Y-%m-%d')}
 """
 
-        output_path = os.path.join(
-            output_base, self.OUTPUT_DIR,
-            f"{info['issuer']}-募集资金运用.md"
-        )
+        output_path = os.path.join(output_base, self.OUTPUT_DIR, f"{info['issuer']}-募集资金运用.md")
         self.write_note(output_path, template)
         return output_path
 
 
 def main():
-    """主函数"""
     raw_dir = "raw"
     knowledge_dir = "knowledge"
 
@@ -625,13 +628,11 @@ def main():
     for pdf_file in pdf_files:
         pdf_path = os.path.join(raw_dir, pdf_file)
         print(f"处理：{pdf_file}")
-
         with FundUsageExtractor(pdf_path) as extractor:
             extractor.parse_issuer_name()
             extractor.parse_bond_info()
             output_file = extractor.generate_note(knowledge_dir)
             print(f"  生成：{output_file}")
-
         print("-" * 50)
 
     print("\n处理完成！")

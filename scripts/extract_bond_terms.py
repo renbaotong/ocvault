@@ -153,18 +153,18 @@ class BondTermsExtractor(BaseExtractor):
                                 f"issue_scale 匹配到授信/银行相关内容({val}亿)，已跳过"
                             )
 
-        # 校验：本期发行规模不应超过注册规模，且应在合理范围（1-15亿）
+        # 校验：本期发行规模不应超过注册规模，且应在合理范围（1-50亿）
         if info["register_scale"] and info["issue_scale"]:
             reg_match = re.search(r'(\d+(?:\.\d+)?)', info["register_scale"])
             iss_match = re.search(r'(\d+(?:\.\d+)?)', info["issue_scale"])
             if reg_match and iss_match:
                 reg_val = float(reg_match.group(1))
                 iss_val = float(iss_match.group(1))
-                # 业务规则：注册规模不超过15亿、不少于1亿
-                if reg_val > 15:
-                    self._logger.warning(f"注册规模({reg_val}亿)超过业务合理范围(15亿)")
-                if iss_val > 15:
-                    self._logger.warning(f"本期发行规模({iss_val}亿)超过业务合理范围(15亿)")
+                # 业务规则：注册规模不超过50亿、不少于1亿
+                if reg_val > 50:
+                    self._logger.warning(f"注册规模({reg_val}亿)超过业务合理范围(50亿)")
+                if iss_val > 50:
+                    self._logger.warning(f"本期发行规模({iss_val}亿)超过业务合理范围(50亿)")
                 if iss_val > reg_val:
                     self._logger.warning(
                         f"本期发行规模({iss_val}亿)超过注册规模({reg_val}亿)，可能是提取错误"
@@ -233,6 +233,26 @@ class BondTermsExtractor(BaseExtractor):
             letter = letter_match.group(0) if letter_match else "已获取无异议函"
             return f"{match.group(1)}亿元", letter
 
+        # 模式0c: 精确查找"注册金额为不超过 X 亿元"（适配无"人民币"关键词的场景）
+        match = re.search(
+            r'注册金额为不超过\s*(\d+(?:\.\d+)?)\s*亿',
+            clean_text
+        )
+        if match and float(match.group(1)) > 0:
+            letter_match = re.search(r'[上深]证函.*?号', clean_text)
+            letter = letter_match.group(0) if letter_match else "已获取无异议函"
+            return f"{match.group(1)}亿元", letter
+
+        # 模式0d: 精确查找"注册规模为不超过 X 亿元"
+        match = re.search(
+            r'注册规模为不超过\s*(\d+(?:\.\d+)?)\s*亿',
+            clean_text
+        )
+        if match and float(match.group(1)) > 0:
+            letter_match = re.search(r'[上深]证函.*?号', clean_text)
+            letter = letter_match.group(0) if letter_match else "已获取无异议函"
+            return f"{match.group(1)}亿元", letter
+
         # 模式1：查找"注册总额为人民币 X 亿元"
         match = re.search(
             r'注册总额为人民币\s*(\d+(?:\.\d+)?)\s*亿',
@@ -280,43 +300,43 @@ class BondTermsExtractor(BaseExtractor):
             r'[上深]证函.{0,200}注[^\d]{0,30}?(\d+(?:\.\d+)?)\s*亿',
             clean_text
         )
-        if match and 0 < float(match.group(1)) <= 15:
+        if match and 0 < float(match.group(1)) <= 50:
             letter_match = re.search(r'[上深]证函.*?号', clean_text)
             letter = letter_match.group(0) if letter_match else ""
             return f"{match.group(1)}亿元", letter
 
-        # 模式4：上证函/深证函...号...同意...不超过...（限制范围，业务规则：不超过15亿）
+        # 模式4：上证函/深证函...号...同意...不超过...（限制范围，业务规则：不超过50亿）
         match = re.search(
             r'[上深]证函.{0,150}同意.{0,80}不超过.{0,30}(\d+(?:\.\d+)?)\s*亿',
             clean_text
         )
-        if match and 0 < float(match.group(1)) <= 15:
+        if match and 0 < float(match.group(1)) <= 50:
             letter_match = re.search(r'[上深]证函.*?号', clean_text)
             letter = letter_match.group(0) if letter_match else "已获取无异议函"
             return f"{match.group(1)}亿元", letter
 
-        # 模式5：无异议函...不超过...（不含函号，业务规则：不超过15亿）
+        # 模式5：无异议函...不超过...（不含函号，业务规则：不超过50亿）
         match = re.search(
             r'无异议函.*?不超过.*?(\d+(?:\.\d+)?)\s*亿',
             clean_text
         )
-        if match and 0 < float(match.group(1)) <= 15:
+        if match and 0 < float(match.group(1)) <= 50:
             return f"{match.group(1)}亿元", "已获取无异议函"
 
-        # 模式6：同意...发行...不超过...（业务规则：不超过15亿）
+        # 模式6：同意...发行...不超过...（业务规则：不超过50亿）
         match = re.search(
             r'同意.*?发行.*?不超过.*?(\d+(?:\.\d+)?)\s*亿',
             clean_text
         )
-        if match and 0 < float(match.group(1)) <= 15:
+        if match and 0 < float(match.group(1)) <= 50:
             return f"{match.group(1)}亿元", ""
 
-        # 模式7：注册[金额度]...不超过...（兜底，业务规则：不超过15亿且不少于1亿）
+        # 模式7：注册[金额度]...不超过...（兜底，业务规则：不超过50亿且不少于1亿）
         match = re.search(
             r'注册[金额度]?.{0,100}不超过.*?(\d+(?:\.\d+)?)\s*亿',
             clean_text
         )
-        if match and 0 < float(match.group(1)) <= 15:
+        if match and 0 < float(match.group(1)) <= 50:
             return f"{match.group(1)}亿元", ""
 
         return "", ""

@@ -148,27 +148,62 @@ class IssuerProfileExtractor(BaseExtractor):
 
         # 2. 提取注册资本
         capital_patterns = [
-            r'注册资本\s*[:：|]\s*\n?\s*人民币?\s*\n?\s*([\d,\.]+)\s*\n?\s*(万人民币|万元|亿元|元)',
-            r'注册资本\s*[:：|]\s*\n?\s*([\d,\.]+)\s*\n?\s*(万人民币|万元|亿元|元)',
+            r'注册资本\s*[:：|]\s*\n?\s*人民币?\s*\n?\s*([\d,\.]+)\s*\n?\s*(万[元]?|亿[元]?|元)',
+            r'注册资本\s*[:：|]\s*\n?\s*([\d,\.]+)\s*\n?\s*(万[元]?|亿[元]?|元)',
             r'注册资本\s*[:：|]\s*\n?\s*(?:为)?\s*\n?\s*人民币?\s*\n?\s*([\d,\.]+)',
+            # 表格格式：注册资本 | 人民币X亿元 或 注册资本 | X亿元
+            r'注册资本\s*\|?\s*人民币\s*([\d,\.]+)\s*(万|亿)?元?',
+            r'注册资本\s*\|?\s*([\d,\.]+)\s*(万|亿)?元?',
         ]
         for pattern in capital_patterns:
             for st in search_texts:
                 match = re.search(pattern, st)
                 if match:
                     value = self._clean_field_value(match.group(1))
-                    unit = match.group(2) if len(match.groups()) > 1 and match.group(2) else "万元"
+                    if len(match.groups()) > 1 and match.group(2):
+                        unit = match.group(2)
+                        # Normalize unit: ensure ends with "元" not "万"/"亿" alone
+                        if unit in ('万',):
+                            unit = '万元'
+                        elif unit in ('亿',):
+                            unit = '亿元'
+                        elif not unit.endswith('元'):
+                            unit = unit + '元'
+                    else:
+                        unit = "万元"
                     result["注册资本"] = value + unit
                     break
             if result["注册资本"]:
                 break
 
-        # 3. 提取实缴资本
+        # 3. 提取实缴资本（同时支持"实缴资本"和"实收资本"）
         paid_in_patterns = [
-            r'(?:实缴资本|实收资本)\s*[:：|]\s*\n?\s*人民币?\s*\n?\s*([\d,\.]+)\s*\n?\s*(万人民币|万元|亿元|元)',
-            r'(?:实缴资本|实收资本)\s*[:：|]\s*\n?\s*([\d,\.]+)\s*\n?\s*(万人民币|万元|亿元|元)',
+            r'(?:实缴资本|实收资本)\s*[:：|]\s*\n?\s*人民币?\s*\n?\s*([\d,\.]+)\s*\n?\s*(万[元]?|亿[元]?|元)',
+            r'(?:实缴资本|实收资本)\s*[:：|]\s*\n?\s*([\d,\.]+)\s*\n?\s*(万[元]?|亿[元]?|元)',
             r'(?:实缴资本|实收资本)\s*[:：|]\s*\n?\s*(?:为)?\s*\n?\s*人民币?\s*\n?\s*([\d,\.]+)',
+            # 表格格式：实收资本 | 人民币X亿元 或 实缴资本 | X亿元
+            r'(?:实缴资本|实收资本)\s*\|?\s*人民币\s*([\d,\.]+)\s*(万|亿)?元?',
+            r'(?:实缴资本|实收资本)\s*\|?\s*([\d,\.]+)\s*(万|亿)?元?',
         ]
+        for pattern in paid_in_patterns:
+            for st in search_texts:
+                match = re.search(pattern, st)
+                if match:
+                    value = self._clean_field_value(match.group(1))
+                    if len(match.groups()) > 1 and match.group(2):
+                        unit = match.group(2)
+                        if unit in ('万',):
+                            unit = '万元'
+                        elif unit in ('亿',):
+                            unit = '亿元'
+                        elif not unit.endswith('元'):
+                            unit = unit + '元'
+                    else:
+                        unit = "万元"
+                    result["实缴资本"] = value + unit
+                    break
+            if result["实缴资本"]:
+                break
         for pattern in paid_in_patterns:
             for st in search_texts:
                 match = re.search(pattern, st)
@@ -209,7 +244,8 @@ class IssuerProfileExtractor(BaseExtractor):
                 # 尝试匹配 key-value 对
                 field_keywords = ['注册名称', '公司名称', '法定代表人', '注册资本', '实缴资本',
                                   '实收资本', '设立日期', '成立日期', '统一社会信用代码',
-                                  '住所', '注册地址', '所属行业', '经营范围', '信息披露事务负责人',
+                                  '住所', '注册地址', '所属行业', '经营范围', '企业类型',
+                                  '信息披露事务负责人',
                                   '设立（工商注册）日期']
                 j = 0
                 while j < len(parts) - 1:
@@ -409,7 +445,8 @@ class IssuerProfileExtractor(BaseExtractor):
 
         if not is_single_char_format:
             clean = re.sub(r'\.{3,}\s*\d+\s*$', '', text, flags=re.MULTILINE)
-            clean = re.sub(r'(?<=\n)\s*(?:[4-9]\d|[1-9]\d{2})\s*(?=\n[^\d])', '', clean)
+            # Remove standalone page numbers (exactly 3 digits, to avoid removing years like 2016 or content numbers like 60)
+            clean = re.sub(r'(?<=\n)\s*([1-9]\d{2})\s*(?=\n)', '', clean)
             clean = re.sub(r'\n{3,}', '\n\n', clean)
             # 处理"字段名\n字段值"格式（无冒号分隔的表格行）
             clean = self._convert_field_value_lines(clean)
