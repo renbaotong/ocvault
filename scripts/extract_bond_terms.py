@@ -8,7 +8,7 @@
 import os
 import re
 from datetime import datetime
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from extractors import (
     BaseExtractor,
@@ -18,6 +18,7 @@ from extractors import (
     validate_extraction,
     calculate_confidence,
 )
+from typing import Dict, List, Optional
 
 
 class BondTermsExtractor(BaseExtractor):
@@ -42,7 +43,6 @@ class BondTermsExtractor(BaseExtractor):
         info = {
             "issuer": self._issuer_name,
             "bond_type": self._bond_info.bond_type.value if self._bond_info else "公司债",
-            "period": self._bond_info.period if self._bond_info else "",
             "year": self._bond_info.year if self._bond_info else "",
             "register_scale": "",
             "issue_scale": "",
@@ -50,10 +50,11 @@ class BondTermsExtractor(BaseExtractor):
             "bond_term": "",
             "guarantee": "",
             "credit_rating": "",
-            "bond_rating": "",
             "interest_rate": "",
             "repayment_method": "按年付息，到期一次还本",
             "approval_letter": "",
+            "lead_underwriter": "",
+            "co_underwriter": "",
         }
 
         # 先提取注册规模（注册规模是固定的，不超过此值）
@@ -188,10 +189,6 @@ class BondTermsExtractor(BaseExtractor):
                     info["bond_term"] = f"{term}年"
                     break
 
-        match = re.search(r"票面利率 [为：:]?\s*([\d\.]+)", clean)
-        if match:
-            info["interest_rate"] = f"{match.group(1)}%"
-
         info["guarantee"] = self._extract_guarantee(clean, cover_text)
 
         info["credit_rating"] = self.find_pattern(
@@ -199,10 +196,10 @@ class BondTermsExtractor(BaseExtractor):
             clean
         )
 
-        info["bond_rating"] = self.find_pattern(
-            [r"债券 [信用]? 等级 [为：:]?\s*([A-Z][A-Z\+\-]+)", r"债项评级.*?([A-Z][A-Z\+\-]+)"],
-            clean
-        )
+        # 提取承销商信息
+        underwriters = self._extract_underwriters(cover_text, clean)
+        info["lead_underwriter"] = underwriters["lead_underwriter"]
+        info["co_underwriter"] = underwriters["co_underwriter"]
 
         required = ["issuer", "bond_type"]
         missing = validate_extraction(info, required)
@@ -653,6 +650,254 @@ class BondTermsExtractor(BaseExtractor):
 
         return "信用"
 
+    def _extract_underwriter_from_text(self, text: str, patterns: List[str]) -> str:
+        """按优先级试正则模式，返回首个有效公司名"""
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if match:
+                value = match.group(1).strip()
+                if any(suffix in value for suffix in ['股份有限公司', '有限责任公司', '有限公司']):
+                    return value
+        return ""
+
+    def _clean_company_name(self, name: str) -> str:
+        """清理公司名，处理多公司列表"""
+        if not name:
+            return ""
+        # 去除括号及之后的地址信息
+        name = re.sub(r'[\s(（].*$', '', name)
+        name = name.strip()
+        # 处理多家公司（用顿号/逗号分隔）
+        companies = re.split(r'[、，,，;；]', name)
+        cleaned = []
+        for c in companies:
+            c = c.strip()
+            if c and len(c) >= 4 and any(s in c for s in ['股份有限公司', '有限责任公司', '有限公司']):
+                cleaned.append(c)
+        return '、'.join(cleaned) if cleaned else name
+
+    def _extract_underwriters(self, cover_text: str, clean_text: str) -> Dict[str, str]:
+        """从封面和释义章节提取承销商信息"""
+        result: Dict[str, str] = {"lead_underwriter": "", "co_underwriter": ""}
+
+        # --- Step 1: 封面页（去换行） ---
+        cover = cover_text.replace('\n', '').replace(' ', '')
+
+        # 牵头主承销商
+        result["lead_underwriter"] = self._extract_single_underwriter(cover, "牵头主承销商")
+        if not result["lead_underwriter"]:
+            # fallback: 主承销商（排除牵头/联席前缀）
+            result["lead_underwriter"] = self._extract_single_underwriter(cover, "主承销商", exclude_prefixes=["牵头", "联席"])
+
+        # 联席主承销商
+        result["co_underwriter"] = self._extract_single_underwriter(cover, "联席主承销商")
+
+        # --- Step 2: 释义章节 fallback ---
+        if not result["lead_underwriter"] or not result["co_underwriter"]:
+            definition_text = self.extract_section_text(
+                start_patterns=["释义"],
+                end_patterns=["第二节", "二、发行条款", "发行条款"],
+                max_length=15000
+            )
+            if definition_text:
+                definition_text = definition_text.replace('\n', '').replace(' ', '')
+                if not result["lead_underwriter"]:
+                    result["lead_underwriter"] = self._extract_underwriter_from_text(
+                        definition_text,
+                        [
+                            r"(?:牵头主承销商|主承销商)[^指]*?指\s*([一-龥·（）()]{4,60}?(?:股份有限公司|有限责任公司|有限公司))",
+                            r"(?:牵头主承销商|主承销商)[、/]*\s*指\s*([一-龥·（）()]{4,60}?(?:股份有限公司|有限责任公司|有限公司))",
+                        ]
+                    )
+                if not result["co_underwriter"]:
+                    co_match = re.search(
+                        r"联席主承销商指([^指]+)",
+                        definition_text
+                    )
+                    if co_match:
+                        raw_text = co_match.group(1)
+                        # Split by separators and extract company names
+                        parts = re.split(r'[、，,，;；]', raw_text)
+                        cleaned = []
+                        for p in parts:
+                            p = p.strip()
+                            m = re.search(r'([一-龥·]{2,60}?(?:股份有限公司|有限责任公司|有限公司))', p)
+                            if m:
+                                cleaned.append(m.group(1))
+                        if cleaned:
+                            result["co_underwriter"] = '、'.join(cleaned)
+
+        # --- Step 3: 发行有关机构章节 fallback ---
+        # Always check back pages if either field is empty
+        if not result["lead_underwriter"] or not result["co_underwriter"]:
+            institution_info = self._extract_institutions_from_back_pages()
+            if not result["lead_underwriter"] and institution_info.get("lead_underwriter"):
+                result["lead_underwriter"] = institution_info["lead_underwriter"]
+            # If co_underwriter from back pages is longer (more companies), use it
+            if not result["co_underwriter"] and institution_info.get("co_underwriter"):
+                result["co_underwriter"] = institution_info["co_underwriter"]
+            elif institution_info.get("co_underwriter") and len(institution_info["co_underwriter"]) > len(result.get("co_underwriter", "")):
+                result["co_underwriter"] = institution_info["co_underwriter"]
+
+        # --- Step 4: 清理结果 ---
+        if result["lead_underwriter"]:
+            result["lead_underwriter"] = self._clean_company_name(result["lead_underwriter"])
+        if result["co_underwriter"]:
+            result["co_underwriter"] = self._clean_company_name(result["co_underwriter"])
+
+        return result
+
+    def _extract_single_underwriter(self, text: str, label: str, exclude_prefixes: Optional[List[str]] = None) -> str:
+        """提取单个承销商，支持 / 分隔和 : 分隔格式"""
+        exclude_prefixes = exclude_prefixes or []
+
+        # 找 label 位置
+        idx = text.find(label)
+        if idx < 0:
+            return ""
+
+        # 检查是否被排除的前缀
+        for prefix in exclude_prefixes:
+            before = text[max(0, idx - len(prefix)):idx]
+            if before.endswith(prefix):
+                return ""
+
+        rest = text[idx + len(label):]
+
+        # 格式1: label/其他标签...公司名 或 label/其他标签：（住所：...）（公司名在别处）
+        if rest.startswith('/'):
+            rest = rest[1:]  # 去掉 /
+            # 先检查是否是 label/标签：（住所：...）格式（公司名未列出）
+            # 如果 / 后面紧跟的是标签（簿记管理人/受托管理人等）然后是冒号和括号，则公司名未直接列出
+            if re.match(r'(?:簿记管理人|受托管理人|承销商)[：:=]\s*[（(]', rest):
+                return ""
+            # 否则找第一个公司名（跳过簿记管理人/受托管理人等中间标签）
+            company_pat = re.compile(
+                r'(?:簿记管理人|受托管理人|承销商|管理人)?'
+                r'([一-龥·]{4,20}?(?:股份有限公司|有限责任公司|有限公司))'
+            )
+            m = company_pat.search(rest)
+            if m:
+                # 验证：公司名不应包含增信/担保相关关键词
+                name = m.group(1)
+                if any(kw in name for kw in ['增信', '担保', '融资担保', '信用评级', '评级', '会计师', '审计', '律师', '法律顾问']):
+                    return ""
+                return name
+
+        # 格式2: label、其他标签：公司名
+        colon_match = re.match(r'[、，,][^：:=]*[：:=]\s*([一-龥·]{4,60}?(?:股份有限公司|有限责任公司|有限公司))', rest)
+        if colon_match:
+            return colon_match.group(1)
+
+        # 格式3: label：公司名
+        colon_match = re.match(r'[：:=]\s*([一-龥·]{4,60}?(?:股份有限公司|有限责任公司|有限公司))', rest)
+        if colon_match:
+            return colon_match.group(1)
+
+        return ""
+
+    def _extract_institutions_from_back_pages(self) -> Dict[str, str]:
+        """从募集说明书后半部分的'发行有关机构'章节提取承销商信息"""
+        result: Dict[str, str] = {"lead_underwriter": "", "co_underwriter": ""}
+
+        # 提取最后 80 页文本
+        start_page = max(0, len(self.doc) - 80)
+        section_text = ""
+        for page in self.doc[start_page:]:
+            section_text += page.get_text()
+        section_clean = section_text.replace('\n', '').replace(' ', '')
+
+        # 找到"发行有关机构"章节（支持多种标题变体）
+        idx = -1
+        for header in ['本期债券发行的有关机构', '本次债券发行的有关机构', '发行有关机构']:
+            idx = section_clean.find(header)
+            if idx >= 0:
+                break
+        if idx < 0:
+            return result
+
+        inst_section = section_clean[idx:idx + 10000]
+
+        # === 提取主承销商/牵头主承销商 ===
+        # 常见格式：
+        # （二）主承销商/簿记管理人/债券受托管理人名称：东莞证券股份有限公司
+        # （二）主承销商/簿记管理人/债券受托管理人：广发证券股份有限公司
+        # （二）主承销商、簿记管理人、受托管理人名称：中信建投证券股份有限公司
+        # 二、主承销商/受托管理人/簿记管理人名称：华金证券股份有限公司
+        lead_patterns = [
+            # 牵头主承销商（明确标注）
+            r'牵头主承销商[^名]{0,30}?名称\s*[：:=]\s*([一-龥·]{4,60}?(?:股份有限公司|有限责任公司|有限公司))',
+            r'牵头主承销商[^：:=]*[：:=]\s*([一-龥·]{4,60}?(?:股份有限公司|有限责任公司|有限公司))',
+            # 主承销商/簿记管理人/...名称：XXX
+            r'主承销商[/、，,][^名]{0,40}?名称\s*[：:=]\s*([一-龥·]{4,60}?(?:股份有限公司|有限责任公司|有限公司))',
+            # 主承销商/簿记管理人/...：XXX（无"名称"二字）
+            r'主承销商[/、，,][^：:=]{0,20}[：:=]\s*([一-龥·]{4,60}?(?:股份有限公司|有限责任公司|有限公司))',
+            # 主承销商、...名称：XXX
+            r'主承销商、[^名]{0,40}?名称\s*[：:=]\s*([一-龥·]{4,60}?(?:股份有限公司|有限责任公司|有限公司))',
+            # 主承销商：XXX
+            r'主承销商[：:=]\s*([一-龥·]{4,60}?(?:股份有限公司|有限责任公司|有限公司))',
+            # 承销机构、簿记管理人、受托管理人名称：XXX（部分PDF用"承销机构"替代"主承销商"）
+            r'承销机构[^名]{0,30}?名称\s*[：:=]\s*([一-龥·]{4,60}?(?:股份有限公司|有限责任公司|有限公司))',
+        ]
+
+        for pattern in lead_patterns:
+            m = re.search(pattern, inst_section)
+            if m:
+                name = m.group(1)
+                result["lead_underwriter"] = self._clean_company_name(name)
+                break
+
+        # === 提取所有联席主承销商（支持多家）===
+        co_companies = []
+
+        # 先用 re.findall 捕获所有格式A的匹配（可能有多家独立的"联席主承销商：XXX"）
+        co_patterns = [
+            r'联席主承销商[^名]{0,30}?名称\s*[：:=]\s*([一-龥·]{4,60}?(?:股份有限公司|有限责任公司|有限公司))',
+            r'联席主承销商[^：:=]*[：:=]\s*([一-龥·]{4,60}?(?:股份有限公司|有限责任公司|有限公司))',
+            r'联席主承销商[/、，,][^名]{0,40}?名称\s*[：:=]\s*([一-龥·]{4,60}?(?:股份有限公司|有限责任公司|有限公司))',
+        ]
+        for pattern in co_patterns:
+            matches = re.findall(pattern, inst_section)
+            co_from_a = [self._clean_company_name(m) for m in matches if self._clean_company_name(m)]
+            if co_from_a:
+                co_companies.extend(co_from_a)
+                break
+
+        # 再用格式B：在"联席主承销商"区块内找所有"名称：XXX"（补充同区块下的多家公司）
+        co_header_idx = inst_section.find('联席主承销商')
+        if co_header_idx >= 0:
+            co_section = inst_section[co_header_idx:]
+            # 找到联席区块结尾（律师事务所、登记结算、或下一数字标题）
+            end_patterns = ['律师事务所', '登记、托管', '登记结算', '托管、结算',
+                            '（三）', '三、', '(三)',
+                            '（四）', '四、', '(四)',
+                            '五、', '六、', '七、']
+            co_end = len(co_section)
+            for end_pat in end_patterns:
+                e = co_section.find(end_pat)
+                if e > 0 and e < co_end:
+                    co_end = e
+            co_section = co_section[:co_end]
+
+            # 提取区块内所有"名称：XXX公司"
+            name_matches = re.findall(
+                r'名称\s*[：:=]\s*([一-龥·]{4,60}?(?:股份有限公司|有限责任公司|有限公司))',
+                co_section
+            )
+            for m in name_matches:
+                cleaned = self._clean_company_name(m)
+                if cleaned and cleaned not in co_companies:
+                    co_companies.append(cleaned)
+
+        # 过滤掉已经作为牵头主承销商提取的公司
+        if result["lead_underwriter"] and result["lead_underwriter"] in co_companies:
+            co_companies.remove(result["lead_underwriter"])
+
+        if co_companies:
+            result["co_underwriter"] = '、'.join(co_companies)
+
+        return result
+
     def generate_note(self, output_base: str) -> str:
         """生成发行条款笔记"""
         info = self.extract_key_info()
@@ -674,7 +919,6 @@ class BondTermsExtractor(BaseExtractor):
                 "year": info["year"].replace("年", ""),
                 "guarantee": info.get("guarantee", ""),
                 "credit_rating": info.get("credit_rating", ""),
-                "bond_rating": info.get("bond_rating", ""),
             }
         )
 
@@ -696,12 +940,11 @@ class BondTermsExtractor(BaseExtractor):
 | 注册规模 | {info['register_scale'] or '/'} {register_note if register_note else ''} |
 | 本期发行规模 | {info['issue_scale'] or '/'} |
 | 债券期限 | {info['bond_term'] or '/'} |
-| 票面利率 | {info['interest_rate'] or '/'} |
 | 增信措施 | {info['guarantee'] or '/'} |
 | 主体评级 | {info['credit_rating'] or '/'} |
-| 债项评级 | {info['bond_rating'] or '/'} |
 | 债券类型 | {info['bond_type']} |
-| 期数 | {info['period']} |
+| 牵头主承销商 | {info['lead_underwriter'] or '/'} |
+| 联席主承销商 | {info['co_underwriter'] or '/'} |
 
 ## 注册文件依据
 
