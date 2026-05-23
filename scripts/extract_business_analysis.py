@@ -274,6 +274,11 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
         if has_financial_table and ('营业收入' in text or '营业成本' in text or '毛利率' in text or '毛利润' in text):
             return True
 
+        # 新增：包含"业务板块"作为表头 + "金额"/"占比"列 + 报告期年份 → 收入/成本表格页
+        if '业务板块' in text and '金额' in text and '占比' in text:
+            if re.search(r'202[2345]', text):
+                return True
+
         return False
 
     def _analyze_page_section_v3(self, page_text: str) -> Dict[str, any]:
@@ -417,6 +422,9 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
         header_count = sum(1 for kw in header_indicators if kw in curr_combined_text)
         # 单独检查第一行的关键指标
         first_row_key_count = sum(1 for kw in ['业务板块', '业务板块名称', '业务名称', '业务种类', '业务类型'] if kw in curr_first_row_text)
+        # 仅统计业务类型关键词（不含"金额"/"占比"等通用列名），
+        # 因为收入/成本/利润表都使用相同的"金额/占比"列结构
+        business_header_count = sum(1 for kw in ['业务板块', '业务板块名称', '业务名称', '业务种类', '业务类型'] if kw in curr_combined_text)
 
         # 检查上一页最后一行是否为"合计"行
         is_prev_total = False
@@ -453,7 +461,7 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
         # 检查上一页最后一行是否包含数字（数据行特征）
         prev_last_vals = [c for c in prev_table[-1] if c and c.strip()] if prev_table else []
         prev_last_has_num = any(re.search(r'\d', v) for v in prev_last_vals) if prev_last_vals else False
-        if prev_last_has_num and header_count <= 1:
+        if prev_last_has_num and business_header_count <= 1:
             return True
 
         return False
@@ -756,6 +764,7 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
 
             # 获取各表格在页面文本中的位置范围
             table_positions = []  # [(start_pos, end_pos), ...]
+            search_start = 0  # 确保每个表格的位置搜索从上一个表格之后开始
             for tinfo in page_tables:
                 table = tinfo['table']
                 first_name = ''
@@ -766,16 +775,20 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
                             first_name = row[0].strip()
                         last_name = row[0].strip()
 
-                start_pos = page_text.find(first_name) if first_name else -1
+                # 从上一个表格之后开始搜索，避免找到重复业务名称的其他位置
+                start_pos = page_text.find(first_name, search_start) if first_name else -1
                 end_pos = page_text.rfind(last_name) if last_name else -1
                 if start_pos < 0:
                     start_pos = 0
                 if end_pos < 0:
                     end_pos = len(page_text)
                 table_positions.append((start_pos, end_pos))
+                search_start = end_pos  # 下一个表格从当前表格之后开始搜索
 
             # 为每个表格查找最近的关键词
             for ti, (start_pos, end_pos) in enumerate(table_positions):
+                tinfo = page_tables[ti]
+                orig_idx = tinfo['table_idx']
                 # 方法1：查找表格起始位置之前的关键词
                 best_type_before = None
                 best_pos_before = -1
@@ -838,15 +851,16 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
                         if ti == all_large_tables[0][0]:
                             final_type = 'revenue'
                         elif ti == all_large_tables[1][0]:
-                            final_type = 'gross_profit'
+                            # 第二大的表默认为 cost（不再误分配为 gross_profit）
+                            final_type = 'cost'
 
                 if final_type:
-                    table_type_hints[(page_num, ti)] = final_type
+                    table_type_hints[(page_num, orig_idx)] = final_type
 
             # 如果部分表格没有找到位置线索，但有明显的"毛利润"+"毛利率"共存
             # 且表格都有大数值特征，则按表格顺序推断
             if len(page_tables) >= 2:
-                hinted_count = sum(1 for ti in range(len(page_tables)) if (page_num, ti) in table_type_hints)
+                hinted_count = sum(1 for ti, tinfo in enumerate(page_tables) if (page_num, tinfo['table_idx']) in table_type_hints)
                 if hinted_count < len(page_tables):
                     # 检查是否有"营业收入"和"毛利润"关键词共存
                     page_lower = page_text.lower()
@@ -859,7 +873,7 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
                         large_table_indices = []
                         for ti, tinfo in enumerate(page_tables):
                             if self._is_gross_profit_amount_table(tinfo['table']):
-                                large_table_indices.append(ti)
+                                large_table_indices.append(tinfo['table_idx'])
 
                         if len(large_table_indices) >= 2:
                             # 第一个大数值表归为 revenue
@@ -878,8 +892,8 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
                         # 只有"毛利润"没有"营业收入" → 大数值表归为毛利润
                         for ti, tinfo in enumerate(page_tables):
                             if self._is_gross_profit_amount_table(tinfo['table']):
-                                if (page_num, ti) not in table_type_hints:
-                                    table_type_hints[(page_num, ti)] = 'gross_profit'
+                                if (page_num, tinfo['table_idx']) not in table_type_hints:
+                                    table_type_hints[(page_num, tinfo['table_idx'])] = 'gross_profit'
 
                     # 新增：页面没有明确章节关键词，但多个表格顺序排列
                     # 按常见的 收入→成本→毛利率 顺序推断
@@ -909,6 +923,7 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
 
                             table_features.append({
                                 'ti': ti,
+                                'orig_idx': tinfo['table_idx'],
                                 'is_cost_header': is_cost_header,
                                 'is_margin_header': is_margin_header,
                                 'is_amount_pct': is_amount_pct,
@@ -918,7 +933,7 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
 
                         # 按表格顺序分配：第一个大表=revenue，第二个可能=cost/margin
                         for fi, feat in enumerate(table_features):
-                            key = (page_num, feat['ti'])
+                            key = (page_num, feat['orig_idx'])
                             if key in table_type_hints:
                                 continue
                             if feat['is_cost_header']:
@@ -933,11 +948,17 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
             # 通过数值特征纠正：gross_profit 表应包含大数值（万元），
             # 毛利率表包含百分比值（< 200）
             for ti, tinfo in enumerate(page_tables):
-                hint = table_type_hints.get((page_num, ti))
+                orig_idx = tinfo['table_idx']
+                hint = table_type_hints.get((page_num, orig_idx))
                 if hint == 'gross_profit':
                     if not self._is_gross_profit_amount_table(tinfo['table']):
                         # 不是毛利润金额表 → 可能是毛利率百分比表
-                        table_type_hints[(page_num, ti)] = 'margin_pct'
+                        table_type_hints[(page_num, orig_idx)] = 'margin_pct'
+                # 反向纠正：位置推断将毛利润金额表误分类为 margin_pct
+                elif hint == 'margin_pct':
+                    if self._is_gross_profit_amount_table(tinfo['table']):
+                        table_type_hints[(page_num, orig_idx)] = 'gross_profit'
+
 
             # 新增：同一类型有多个候选表格时，选择数据更完整的
             # 例如：南通的营业成本表在 page 44 是部分的（只有2行+合计），
@@ -957,24 +978,26 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
             # 修复：当同一页面所有表格都被分配为同一类型时（通常因为共享业务名称
             # 导致位置推断失效），清除 hints，改由 _identify_table_type_v3 的表头匹配处理
             if len(page_tables) >= 2:
-                hints_for_page = [table_type_hints.get((page_num, ti)) for ti in range(len(page_tables))]
+                hints_for_page = [table_type_hints.get((page_num, tinfo['table_idx'])) for tinfo in page_tables]
                 non_none_hints = [h for h in hints_for_page if h is not None]
                 if non_none_hints and len(set(non_none_hints)) == 1:
                     # 所有表格都被分配为同一类型，清除 hints
-                    for ti in range(len(page_tables)):
-                        table_type_hints.pop((page_num, ti), None)
+                    for tinfo in page_tables:
+                        table_type_hints.pop((page_num, tinfo['table_idx']), None)
 
             # 如果有多个页面有同一类型的表格，保留行数最多的
+            # 注意：仅当一个表明显不完整（行数很少）时才跳过，
+            # 避免将不同章节的完整表格误判为重复
             for hint_type, candidates in type_candidates.items():
                 if len(candidates) > 1:
                     candidates.sort(key=lambda x: x[2], reverse=True)
-                    # 只保留行数最多的，其他的标记为 skip
                     best = candidates[0]
                     for c in candidates[1:]:
-                        if c[2] < best[2]:  # 只有行数更少时才跳过
+                        # 只有当行数差距显著（最好的 >= 8 行且当前 < 最好的一半）时才跳过
+                        if best[2] >= 8 and c[2] < best[2] * 0.5:
                             table_type_hints[c[:2]] = 'skip_incomplete'
 
-        # 基于 type hints，设置 margin_skip 和 force_type
+            # 基于 type hints，设置 margin_skip 和 force_type
         margin_skip_indices = set()
         force_types = {}  # {(page_num, table_idx): forced_type}
 
@@ -1019,6 +1042,14 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
             # 这避免在有明确 margin 上下文的页面上误用此逻辑
             section_info = page_tables[0]['section_info']
             page_lower = page_text.lower()
+
+            # 增强：页面必须有至少一个主营业务相关关键词（营业收入/营业成本/毛利润/毛利率/主营业务），
+            # 避免在无关页面（如合同签约表页面）误触发此逻辑
+            has_any_business_context = any(kw in page_lower for kw in [
+                '营业收入', '营业成本', '毛利润', '毛利率', '主营业务'
+            ])
+            if not has_any_business_context:
+                continue
 
             # 如果页面已有明确的毛利率上下文且有2个以上表格，且页面和表格都不包含营业收入关键词，跳过
             has_rev_kw = '营业收入' in page_lower
@@ -1220,6 +1251,54 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
                         result[table_type] = self._format_table_to_markdown_v3(table)
                         print(f"  识别到 {table_type} 表格 (第{page_num + 1}页)")
 
+        # 新增：当同一页面有多个结构相同（共享业务名称+相同表头）的表格时，
+        # 通常是收入表和成本表分列。页面有"营业收入"或"营业成本"上下文即可触发。
+        for page_num, page_tables in tables_by_page.items():
+            if len(page_tables) < 2:
+                continue
+            page_text_lower = page_tables[0]['page_text'].lower()
+            has_rev_ctx = '营业收入' in page_text_lower
+            has_cost_ctx = '营业成本' in page_text_lower
+
+            if has_rev_ctx or has_cost_ctx:
+                # 提取各表格的业务名称和表头（仅比较真正的表头行，不包含数据行）
+                table_sigs = []
+                for tinfo in page_tables:
+                    table = tinfo['table']
+                    names = set()
+                    for row in table[2:]:
+                        if row and row[0] and row[0].strip() and row[0].strip() not in ('合计', '小计', '总计'):
+                            if not re.match(r'^\d+$', row[0].strip()):
+                                names.add(row[0].strip())
+                    # 只取前2行作为表头（避免包含数据行导致比较失败）
+                    header = ' '.join([' '.join(r) for r in table[:2]]).lower()
+                    table_sigs.append({
+                        'names': names,
+                        'header': header,
+                        'table': table,
+                        'tinfo': tinfo,
+                    })
+
+                # 检查是否有两个表格共享相同业务名称和表头
+                for i in range(len(table_sigs)):
+                    for j in range(i+1, len(table_sigs)):
+                        overlap = len(table_sigs[i]['names'] & table_sigs[j]['names'])
+                        same_header = table_sigs[i]['header'] == table_sigs[j]['header']
+                        if overlap >= 2 and same_header:
+                            # 两个表格结构相同，页面有收入+成本上下文 → 分别归类
+                            if result.get('revenue') and not result.get('cost'):
+                                # revenue 已填充，尝试将另一个表格归为 cost
+                                result['cost'] = self._format_table_to_markdown_v3(table_sigs[j]['table'])
+                                print(f"  识别到 cost 表格 (同页双表重分类, 第{page_num + 1}页)")
+                            elif not result.get('revenue') and not result.get('cost'):
+                                # 都未填充 → 第一个归为 revenue，第二个归为 cost
+                                result['revenue'] = self._format_table_to_markdown_v3(table_sigs[i]['table'])
+                                result['cost'] = self._format_table_to_markdown_v3(table_sigs[j]['table'])
+                                print(f"  识别到 revenue 和 cost 表格 (同页双表分配, 第{page_num + 1}页)")
+                            break
+                    if result.get('cost'):
+                        break
+
         # 后处理：当同一页面有多个结构相同但类型重复的表格时，尝试重新分配
         # 注意：此逻辑仅用于处理同一类型被重复识别的情况，不用于填充空位
         # 毛利润金额表不应用于填充 cost 空位
@@ -1326,6 +1405,9 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
                         continue
                     # 排除景区信息表
                     if any(kw in all_text_scan for kw in ['景区名称', '景区等级', '主要景点', '门票收费']) and not re.search(r'业务板块|毛利润|毛利率', all_text_scan):
+                        continue
+                    # 排除开发成本表（项目开发成本明细，非分板块营业成本）
+                    if '开发成本' in all_text_scan and any(kw in all_text_scan for kw in ['建筑安装', '前期费用', '专业费用', '不可预见费', '投资利息']):
                         continue
 
                     # 计算数值特征
@@ -1608,6 +1690,15 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
         if has_permit:
             return None
 
+        # 新增：排除开发成本表（房地产/工业项目开发成本，如建筑安装工程费+前期费用）
+        # 这类表格是项目成本明细，不是分板块营业成本表
+        has_development_cost = '开发成本' in all_text and any(kw in all_text for kw in [
+            '建筑安装工程', '前期费用', '专业费用', '不可预见费', '投资利息',
+            '租售收入', '开发项目', '项目分类'
+        ])
+        if has_development_cost:
+            return None
+
         # 排除22：单位成本分析表（元/吨、百分比构成等明细拆解）
         has_unit_cost = ('元/吨' in all_text or '其中：' in all_text) and \
                         not re.search(r'业务板块|业务名称|营业收入|营业成本|毛利润|毛利率|项目.*202', all_text)
@@ -1684,7 +1775,7 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
         # 注意：同时匹配"营业收入"和"主营业务收入"变体
         has_revenue_header = (('营业收入' in header_text or '主营业务收入' in header_text)
                               and '成本' not in header_text and '毛利率' not in header_text and '毛利润' not in header_text)
-        has_cost_header = ('营业成本' in header_text or '主营业务成本' in header_text) and '收入' not in header_text and '毛利率' not in header_text
+        has_cost_header = ('营业成本' in header_text or '主营业务成本' in header_text or '成本金额' in header_text) and '收入' not in header_text and '毛利率' not in header_text
         has_margin_header = '毛利率' in header_text or '毛利润' in header_text
 
         num_cols = len(table[0]) if table else 0
@@ -1721,7 +1812,11 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
                 return "margin"
 
         # 辅助判断：页面包含"毛利率"且表格特征符合（少列、小数值、无千分位）
-        if has_margin_in_page and num_cols <= 5 and not has_comma_numbers and has_small_decimals:
+        # 排除：带"业务板块"列的表格（这是收入/成本分板块表，不是毛利率百分比表）
+        # 增强：表格自身必须包含"毛利率"/"毛利润"关键词，或表头有"毛利率"/"毛利"，
+        # 避免将仅页面正文提及"毛利率"的无关表格误判（如合同签约表）
+        has_margin_in_table = '毛利率' in all_text or '毛利润' in all_text or '毛利率' in header_text or '毛利' in header_text
+        if has_margin_in_page and has_margin_in_table and not has_business_column and num_cols <= 5 and not has_comma_numbers and has_small_decimals:
             if data_rows:
                 first_cell = data_rows[0][0] if data_rows[0] else ''
                 if not re.match(r'^20\d{2}', first_cell.strip()):
@@ -1758,8 +1853,8 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
             # 通用金额表 + 业务板块 + 报告期年份 → 营业收入表
             # 注意：has_cost/has_profit/has_margin 仅检查表格自身内容，
             # 不检查页面上下文（同一页面可能有多个不同类型的表格）
-            table_has_cost_kw = '营业成本' in all_text or '成本' in header_text
-            table_has_profit_kw = '毛利润' in all_text
+            table_has_cost_kw = '营业成本' in all_text or '主营业务成本' in all_text or '成本' in header_text
+            table_has_profit_kw = '毛利润' in all_text or '主营业务利润' in all_text
             table_has_margin_kw = '毛利率' in all_text or '毛利率' in header_text
             if has_reporting_year_in_data and not table_has_cost_kw and not table_has_profit_kw and not table_has_margin_kw:
                 return "revenue"
