@@ -288,6 +288,20 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
         """
         text_lower = page_text
 
+        # 新增：检测组合标题 "营业收入、毛利润及毛利率情况" 等
+        # 当此类组合标题出现时，页面同时包含 revenue/cost/margin 三个章节
+        # （鹤壁恒源场景："发行人近两年及一期营业收入、毛利润及毛利率情况如下所示"）
+        has_combined_section = False
+        combined_patterns = [
+            '营业收入、毛利润', '营业收入、毛利率',
+            '营业收入和毛利润', '营业收入和毛利率',
+            '营业收入及毛利润', '营业收入及毛利率',
+        ]
+        for cp in combined_patterns:
+            if cp in text_lower:
+                has_combined_section = True
+                break
+
         # 查找各章节的标题位置
         revenue_patterns = ['营业收入构成', '营业收入情况', '营业收入如下', '分板块营业收入', '主营业务收入构成', '主营业务板块收入', '营业收入结构', '营业收入构成情况', '主营业务收入情况', '主营业务收入如下']
         cost_patterns = ['营业成本构成', '营业成本情况', '营业成本如下', '主营业务成本构成', '主营业务成本情况', '主营业务成本如下', '营业成本构成情况', '成本构成情况', '主营业务成本情况表']
@@ -305,12 +319,22 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
         cost_idx = find_first_position(cost_patterns, text_lower)
         margin_idx = find_first_position(margin_patterns, text_lower)
 
+        # 当组合标题存在时，覆盖各章节的 idx 为 0（视为同时出现）
+        if has_combined_section:
+            if revenue_idx < 0:
+                revenue_idx = 0
+            if cost_idx < 0:
+                cost_idx = 0
+            if margin_idx < 0:
+                margin_idx = 0
+
         # 修复：当 margin 匹配来自"毛利润及毛利率"等组合标题时，
         # 如果"营业收入"出现在同一组合标题中且位置更前，则 margin_idx 无效
         # （叠石桥场景：页面标题"营业收入、毛利润及毛利率情况"，
         #  "毛利润情况" 在 346 位匹配但 "营业收入情况" 在 362 位，
         #  导致 margin 被错误判定为最先出现的章节）
-        if margin_idx >= 0:
+        # 注意：已在上方 has_combined_section 处理，此处不再重复处理
+        if margin_idx >= 0 and not has_combined_section:
             # 检查 margin 匹配是否来自组合标题
             context = text_lower[max(0, margin_idx - 30):margin_idx + 30]
             has_combined_title = '营业收入' in context and (
@@ -771,14 +795,18 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
                 'revenue': ['营业收入情况', '营业收入如下', '营业收入构成', '营业收入情况如下',
                            '营业收入结构', '分板块营业收入', '主营业务收入构成',
                            '主营业务收入如下', '主营业务收入情况', '发行人营业收入',
-                           '营业收入情况表', '营业收入构成情况', '收入情况', '收入如下'],
+                           '营业收入情况表', '营业收入构成情况', '收入情况', '收入如下',
+                           '公司主营业务收入情况'],
                 'cost': ['营业成本情况', '营业成本如下', '营业成本构成', '营业成本情况如下',
                         '主营业务成本构成', '主营业务成本情况', '主营业务成本如下',
-                        '成本构成情况', '营业成本构成情况'],
+                        '成本构成情况', '营业成本构成情况',
+                        '公司主营业务成本情况'],
                 'margin_pct': ['毛利率情况', '毛利率如下', '毛利率构成', '毛利率情况如下',
-                              '营业毛利率构成', '各业务板块毛利率'],
+                              '营业毛利率构成', '各业务板块毛利率',
+                              '公司主营业务毛利率情况'],
                 'gross_profit': ['毛利润情况', '毛利润如下', '毛利润构成', '毛利润情况如下',
-                                '营业毛利润构成', '各业务板块毛利润', '毛利润及毛利率'],
+                                '营业毛利润构成', '各业务板块毛利润', '毛利润及毛利率',
+                                '公司主营业务毛利润情况'],
             }
 
             # 获取各表格在页面文本中的位置范围
@@ -1056,6 +1084,28 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
                     if force_types.get(key) == 'cost':
                         force_types[key] = 'revenue'
 
+        # 新增：校正位置推断错误 - 基于表格标题行覆盖错误的分类
+        # 当表格第一行是明确的标题（如"公司主营业务成本情况"），应覆盖位置推断结果
+        for page_num, page_tables in tables_by_page.items():
+            for tinfo in page_tables:
+                table = tinfo['table']
+                orig_idx = tinfo['table_idx']
+                title_row = table[0][0].strip() if table and table[0] else ''
+                key = (page_num, orig_idx)
+                current_hint = force_types.get(key)
+
+                if title_row and len(title_row) < 30:
+                    if ('主营业务成本情况' in title_row or '营业成本情况' in title_row) and current_hint not in ('cost', 'skip'):
+                        force_types[key] = 'cost'
+                    elif ('主营业务毛利率情况' in title_row or '营业毛利率情况' in title_row) and current_hint != 'margin':
+                        force_types[key] = 'margin'
+                    elif ('主营业务毛利润情况' in title_row or '营业毛利润情况' in title_row):
+                        # 毛利润金额表 → 归为 cost
+                        if current_hint not in ('cost', 'skip'):
+                            force_types[key] = 'cost'
+                    elif ('主营业务收入情况' in title_row or '营业收入情况' in title_row) and current_hint not in ('revenue', 'skip'):
+                        force_types[key] = 'revenue'
+
         # 步骤2.6：同一页面多个结构相似表格的差异化处理
         # 当同一页面有多个表格使用相同业务名称和列结构时，通常是收入/成本/毛利率分表
         # 检测这种情况并依次分配给 revenue -> cost -> margin
@@ -1264,6 +1314,7 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
                     # 预过滤：排除子业务板块的明细毛利润/毛利率表（非汇总口径）
                     # 当表格包含特定小业务名称（便利店、罗森等）且只有2-3行数据时，
                     # 通常是某一大业务板块的内部拆解，不应作为全公司成本表（凤城场景）
+                    # 注意：当页面有 revenue 章节（安吉县场景：建材是主营业务）或只有 margin 章节（鹤壁恒源场景：毛利率表）时，不应用此过滤
                     is_sub_segment_detail = False
                     data_row_count = sum(1 for row in table[1:] if row and row[0] and row[0].strip() and row[0].strip() not in ('合计', '小计', '总计', '项目', ''))
                     has_niche_business = any(kw in all_table_text for kw in [
@@ -1271,7 +1322,9 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
                         '开关电源', '驱动电源', '光伏', '棉纺', '针织',
                         '家电', '厨卫', '制冷', '汽车部件', '模具', '车轮'
                     ])
-                    if data_row_count <= 5 and has_niche_business and len(table) <= 10:
+                    has_revenue_context = section_info.get('has_revenue')
+                    is_margin_only_page = section_info.get('has_margin') and not section_info.get('has_revenue') and not section_info.get('has_cost')
+                    if data_row_count <= 5 and has_niche_business and len(table) <= 10 and not has_revenue_context and not is_margin_only_page:
                         is_sub_segment_detail = True
                     if is_sub_segment_detail:
                         continue
@@ -1352,8 +1405,11 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
                         print(f"  识别到 margin 表格 (位置推断, 第{page_num + 1}页)")
                         continue
                     elif forced == 'gross_profit':
-                        # 毛利润表：不用于 margin，跳过
-                        continue
+                        # 毛利润表：不用于 margin 分类，
+                        # 但不跳过 — 让它走到 _identify_table_type_v3，
+                        # 如果 force_cost 无法归为 cost（已填充），
+                        # 标准 margin 检测可将其作为毛利润数据归为 margin
+                        pass
 
                     # 如果是毛利润金额表且同一页面有毛利率百分比表，优先将其归类为 cost
                     is_profit_amount = self._is_gross_profit_amount_table(table)
@@ -1806,6 +1862,17 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
         if has_permit:
             return None
 
+        # 新增：排除运营能力/业务数据表（如供水能力、污水处理量、景区人次等）
+        # 这类表格是业务运营指标，不是分板块营业成本表
+        has_operational_data = any(kw in all_text for kw in [
+            '供水厂', '供水能力', '实际供水量', '污水处理厂', '污水处理能力',
+            '实际污水处理量', '游客人次', '接待游客', '客运量', '货运量',
+            '通车里程', '运营里程', '建筑面积', '施工面积', '竣工面积',
+            '装机容量', '发电量', '上网电量', '产销量', '产量', '销量',
+        ]) and not re.search(r'业务板块|业务名称|分板块', all_text)
+        if has_operational_data:
+            return None
+
         # 新增：排除开发成本表（房地产/工业项目开发成本，如建筑安装工程费+前期费用）
         # 这类表格是项目成本明细，不是分板块营业成本表
         has_development_cost = '开发成本' in all_text and any(kw in all_text for kw in [
@@ -1835,6 +1902,27 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
                              not re.search(r'业务板块|业务名称|分板块', all_text)
         if has_income_summary:
             return None
+
+        # ===== 第1.5步：基于表格标题行的强分类信号 =====
+        # 当表格第一行是标题（如"公司主营业务成本情况"），应直接用于分类
+        title_row = table[0][0].strip() if table and table[0] else ''
+        if title_row and len(title_row) < 30:
+            if '主营业务成本情况' in title_row or '营业成本情况' in title_row or '成本构成' in title_row:
+                # 强信号：成本表
+                if not result.get('cost'):
+                    return 'cost'
+            elif '主营业务毛利率情况' in title_row or '营业毛利率情况' in title_row or '毛利率构成' in title_row:
+                # 强信号：毛利率百分比表
+                if not result.get('margin'):
+                    return 'margin'
+            elif '主营业务毛利润情况' in title_row or '营业毛利润情况' in title_row or '毛利润构成' in title_row:
+                # 毛利润金额表 → 归为 cost（不是 margin 百分比表）
+                if not result.get('cost'):
+                    return 'cost'
+            elif '主营业务收入情况' in title_row or '营业收入情况' in title_row or '收入构成' in title_row:
+                # 强信号：收入表
+                if not result.get('revenue'):
+                    return 'revenue'
 
         # ===== 第二步：提取表格数据特征 =====
 
@@ -1892,18 +1980,24 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
         has_revenue_header = (('营业收入' in header_text or '主营业务收入' in header_text)
                               and '成本' not in header_text and '毛利率' not in header_text and '毛利润' not in header_text)
         has_cost_header = ('营业成本' in header_text or '主营业务成本' in header_text or '成本金额' in header_text) and '收入' not in header_text and '毛利率' not in header_text
-        has_margin_header = '毛利率' in header_text or '毛利润' in header_text
+        has_margin_header = '毛利率' in header_text or ('毛利润' in header_text and '成本' not in header_text)
 
         num_cols = len(table[0]) if table else 0
 
         # ===== 第三步：分类判断 =====
 
         # force_cost: 当毛利润金额表和毛利率百分比表共存时，毛利润表强制归为 cost
+        # 注意：当 cost 已填充时，毛利润表不应被完全跳过，
+        # 而是应作为 margin 的候选（毛利润金额表本身就是毛利润数据）
         if force_cost:
             if (comma_count + numeric_count) >= 3:
                 if not result.get('cost'):
                     return "cost"
-            return None
+            # cost 已填充或数值不足 → 毛利润表直接作为 margin 提取
+            # （毛利润金额表本身就是毛利润数据，是有效的 margin 指标）
+            if result.get('cost'):
+                return "margin"
+            # 数值不足 → 继续走正常分类流程
 
         # 优先检测：毛利润金额表（大数值特征）- 应归为 cost 而非 margin
         # 注意：只在页面没有"营业收入"相关上下文中才检查，避免将收入表误判
@@ -1936,6 +2030,37 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
             if data_rows:
                 first_cell = data_rows[0][0] if data_rows[0] else ''
                 if not re.match(r'^20\d{2}', first_cell.strip()):
+                    return "margin"
+
+        # 新增：纯百分比毛利率表检测 — 表格只有"业务板块+年份"列（无金额/占比），
+        # 数据值全部为0-100范围的小数值，页面上下文有"毛利率"关键词
+        # 典型场景：鹤壁恒源等发行人将毛利率表简化为板块名+年份列，不带"毛利率"表头
+        if has_margin_in_page and has_business_column and num_cols <= 5 and not has_comma_numbers:
+            # 表头只有年份列，没有"金额"/"占比"/"营业收入"/"营业成本"
+            has_only_year_cols = bool(re.search(r'202[2345]', header_text))
+            no_amt_pct = '金额' not in header_text and '占比' not in header_text
+            no_rev_cost = '营业收入' not in header_text and '营业成本' not in header_text
+            if has_only_year_cols and no_amt_pct and no_rev_cost:
+                # 验证数据行是否都是小百分比值（0-100，无千分位逗号）
+                all_pct = True
+                pct_count = 0
+                for row in data_rows:
+                    if not row or not row[0] or row[0].strip() in ('合计', '小计', '总计', ''):
+                        continue
+                    for cell in row[1:]:
+                        if cell and cell.strip():
+                            try:
+                                val = float(cell.strip().replace('%', ''))
+                                if abs(val) > 100:
+                                    all_pct = False
+                                    break
+                                pct_count += 1
+                            except ValueError:
+                                all_pct = False
+                                break
+                    if not all_pct:
+                        break
+                if all_pct and pct_count >= 2 and has_small_decimals:
                     return "margin"
 
         # 营业收入表：表头含"营业收入"，有金额数据，有业务分类
