@@ -14,6 +14,7 @@ import os
 import re
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
+from collections import defaultdict
 
 import pdfplumber
 import fitz
@@ -2234,6 +2235,171 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
 
         return None
 
+    def _restructure_period_table(self, table: List[List[str]]) -> List[List[str]]:
+        """
+        将含有多余列的多年度（金额+占比）表格重构为 7 列标准表格。
+        适用：表格前两列为项目名（col0=主项目, col1=子项目），
+        后续列为各年度的 金额/占比 交替出现。
+
+        策略：pdfplumber 常将合并单元格拆成多列（如 19 列实际是 7 列逻辑表）。
+        此函数先定位年份和类型标签，然后将每个 金额/占比 列归属到最近的年份。
+        """
+        if not table or len(table) < 2:
+            return table
+
+        header_text = ' '.join(str(c) for c in (table[0] + (table[1] if len(table) > 1 else [])))
+        if not ('202' in header_text and '金额' in header_text):
+            return table
+
+        num_cols = max(len(r) for r in table)
+
+        # 计算原始表格的真实表头行数（非固定 min(3, len(table))，否则第一行数据会被误当表头）
+        hdr_rows = 1
+        for ri in range(1, min(4, len(table))):
+            row_text = ' '.join(str(c) for c in (table[ri] if ri < len(table) else []))
+            if '202' in row_text or '金额' in row_text or '占比' in row_text:
+                hdr_rows = ri + 1
+            else:
+                break
+        year_positions = {}  # cell_text -> col_index
+        type_positions = {}  # col_index -> '金额' or '占比'
+
+        for ri in range(hdr_rows):
+            row = table[ri]
+            for ci in range(min(num_cols, len(row))):
+                cell = (row[ci] or '').strip()
+                if not cell:
+                    continue
+                year_match = re.search(r'(20\d\d)', cell)
+                if year_match and cell not in year_positions:
+                    year_positions[cell] = ci
+                if '金额' in cell:
+                    type_positions[ci] = '金额'
+                if '占比' in cell:
+                    type_positions[ci] = '占比'
+
+        if len(year_positions) < 2:
+            return table
+        if not type_positions:
+            return table
+
+        # 检查是否为"已足够干净"的表格（列数接近预期，无需重组）
+        # 预期列数 = 1(项目) + 2 * N(年)
+        expected_cols = 1 + 2 * len(year_positions)
+        # 计算实际有数据的列数
+        actual_data_cols = 0
+        for ci in range(num_cols):
+            for ri2 in range(len(table)):
+                if ci < len(table[ri2]) and table[ri2][ci] and table[ri2][ci].strip():
+                    actual_data_cols += 1
+                    break
+        # 若实际数据列数 ≤ 预期 + 2，说明表格已是干净格式，无需重组
+        # 19 列表格有 ~11+个数据列，7 列表格只有 ~5-7 个
+        if actual_data_cols <= expected_cols + 2:
+            return table
+
+        # 按列位置排序年份
+        sorted_years = sorted(year_positions.items(), key=lambda x: x[1])
+
+        # 为每个年份创建占位
+        period_cols = {}
+        for year_str, sc in sorted_years:
+            yv = re.search(r'(20\d\d)', year_str).group(1)
+            period_cols[yv] = {'start': sc, 'amt_col': None, 'ratio_col': None}
+
+        years = sorted(period_cols.keys(), key=lambda yr: period_cols[yr]['start'])
+
+        # 关键改进：将每个 金额/占比 列分配到最近的年份（而非按区间切割）
+        amt_cols_all = sorted([ci for ci, tp in type_positions.items() if tp == '金额'])
+        ratio_cols_all = sorted([ci for ci, tp in type_positions.items() if tp == '占比'])
+
+        for ci in amt_cols_all:
+            best_yr = min(years, key=lambda yr: abs(ci - period_cols[yr]['start']))
+            # 若该年份已有 amt_col 且更近，跳过
+            existing = period_cols[best_yr].get('amt_col')
+            if existing is None or abs(ci - period_cols[best_yr]['start']) < abs(existing - period_cols[best_yr]['start']):
+                period_cols[best_yr]['amt_col'] = ci
+        for ci in ratio_cols_all:
+            best_yr = min(years, key=lambda yr: abs(ci - period_cols[yr]['start']))
+            existing = period_cols[best_yr].get('ratio_col')
+            if existing is None or abs(ci - period_cols[best_yr]['start']) < abs(existing - period_cols[best_yr]['start']):
+                period_cols[best_yr]['ratio_col'] = ci
+
+        # 重构每行
+        result = []
+        for ri, row in enumerate(table):
+            padded = list(row) + [''] * (num_cols - len(row))
+            new_row = []
+
+            # 项目名列（col0 + col1）
+            item_parts = []
+            for ci in range(2):
+                cell = (padded[ci] or '').strip()
+                if cell:
+                    item_parts.append(cell)
+            new_row.append(' '.join(item_parts))
+
+            # 各年度金额/占比
+            for yr in years:
+                info = period_cols[yr]
+                ac = info.get('amt_col')
+                rc = info.get('ratio_col')
+
+                amt_val = ''
+                if ac is not None and ac < len(padded):
+                    cell = (padded[ac] or '').strip()
+                    if cell and cell != '-':
+                        amt_val = cell
+
+                ratio_val = ''
+                if rc is not None and rc < len(padded):
+                    cell = (padded[rc] or '').strip()
+                    if cell and cell != '-':
+                        ratio_val = cell
+
+                new_row.append(amt_val)
+                new_row.append(ratio_val)
+
+            result.append(new_row)
+
+        # 合并表头行（将 result[0..hdr_rows-1] 的各列拼接成一行）
+        merged_header = []
+        for ci in range(len(result[0])):
+            parts = []
+            for ri in range(hdr_rows):
+                cell = (result[ri][ci] or '').strip()
+                if cell and cell not in parts:
+                    parts.append(cell)
+            merged_header.append(' '.join(parts))
+
+        # 构建最终表格：合并后的单行表头 + 原始数据行（跳过原始表头对应的行）
+        final = [merged_header]
+        for ri in range(hdr_rows, len(result)):
+            final.append(result[ri])
+
+        return final
+
+    def _remove_empty_columns(self, table: List[List[str]]) -> List[List[str]]:
+        """移除表格中全为空/None 的列（pdfplumber 常产生多余空列）"""
+        if not table:
+            return table
+        num_cols = len(table[0])
+        keep = []
+        for col_idx in range(num_cols):
+            for row in table:
+                if col_idx < len(row) and row[col_idx] and row[col_idx].strip():
+                    keep.append(col_idx)
+                    break
+        if not keep:
+            return table
+        # 压缩表头行列数一致后用 keep 筛选
+        max_cols = max(len(row) for row in table)
+        result = []
+        for row in table:
+            padded = list(row) + [""] * (max_cols - len(row))
+            result.append([padded[c] for c in keep])
+        return result
+
     def _format_table_to_markdown_v3(self, table: List[List[str]]) -> str:
         """
         将表格转换为 Markdown 格式 v4.0
@@ -2242,6 +2408,12 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
         if not table or len(table) < 2:
             return ""
 
+        # 尝试重组多年度金额/占比表格（去除多余空列）
+        # 尝试重组多年度金额/占比表格（去除多余空列）
+        table = self._restructure_period_table(table)
+        # 移除全空列（pdfplumber 常产生多余空列）
+        table = self._remove_empty_columns(table)
+
         lines = []
 
         # 确定表头行数（检查前几行是否有空单元格或包含年份）
@@ -2249,7 +2421,7 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
         for i in range(1, min(3, len(table))):
             row_text = ' '.join(table[i])
             # 如果包含年份标记，可能是表头的一部分
-            if any(year in row_text for year in ['202', '金额', '占比', '收入', '成本']):
+            if any(year in row_text for year in ['202', '金额', '占比']):
                 header_rows = i + 1
 
         # 合并表头

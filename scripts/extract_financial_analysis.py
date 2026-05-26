@@ -71,14 +71,15 @@ class FinancialAnalysisExtractor(BaseExtractor):
     FLOW_ITEMS = [
         "货币资金", "应收账款", "预付款项", "其他应收款", "应收票据",
         "存货", "合同资产", "一年内到期的非流动资产", "其他流动资产",
-        "交易性金融资产", "应收款项融资"
+        "交易性金融资产", "应收款项融资", "应收票据及应收账款",
     ]
     # 非流动资产项目
     NON_FLOW_ITEMS = [
         "其他权益工具投资", "长期股权投资", "投资性房地产",
         "固定资产", "在建工程", "工程物资", "使用权资产",
         "无形资产", "开发支出", "商誉", "长期待摊费用",
-        "递延所得税资产", "其他非流动资产"
+        "递延所得税资产", "其他非流动资产",
+        "债权投资", "其他债权投资", "其他非流动金融资产", "非流动资产差额",
     ]
     # 所有资产项目
     ALL_ASSET_ITEMS = FLOW_ITEMS + NON_FLOW_ITEMS + [
@@ -438,6 +439,33 @@ class FinancialAnalysisExtractor(BaseExtractor):
                 i += 1
                 continue
 
+            # 处理 section 标题与首项合并的情况（如 "非流动资产：债权投资"）
+            section_found = False
+            for prefix, section in [("流动资产：", "flow"), ("非流动资产：", "non_flow")]:
+                if line.startswith(prefix):
+                    current_section = section
+                    line = line[len(prefix):].strip()
+                    section_found = True
+                    if not line:
+                        i += 1
+                        continue  # 跳过空行
+                    break
+            if section_found and not line:
+                continue
+            if not section_found:
+                # 也处理无冒号合并版本（如 "流动资产货币资金"）
+                if line.startswith("流动资产") and "合计" not in line:
+                    remaining = line[len("流动资产"):].strip()
+                    if remaining and self._match_asset_item(remaining, merged_lines, i):
+                        current_section = "flow"
+                        line = remaining
+                        section_found = True
+                if not section_found and line.startswith("非流动资产") and "合计" not in line:
+                    remaining = line[len("非流动资产"):].strip()
+                    if remaining and self._match_asset_item(remaining, merged_lines, i):
+                        current_section = "non_flow"
+                        line = remaining
+
             if re.match(r"单位[：:]", line) or ("万元" in line and "%" in line):
                 i += 1
                 continue
@@ -501,6 +529,12 @@ class FinancialAnalysisExtractor(BaseExtractor):
                 i += 1
                 continue
 
+            # 纯数字+空格行（如 "1,021,892.11 100.00 1,012,877.07"）保持独立
+            if re.match(r'^[\d,.\s\-]+$', line) and re.search(r'\d', line):
+                merged.append(line)
+                i += 1
+                continue
+
             # 已知词保持独立
             if line in known_words:
                 merged.append(line)
@@ -529,7 +563,9 @@ class FinancialAnalysisExtractor(BaseExtractor):
         return merged
 
     def _match_asset_item(self, line: str, lines: List[str], index: int) -> Optional[str]:
-        for item in self.ALL_ASSET_ITEMS:
+        # 按长度降序匹配，确保"非流动资产合计"优先于"流动资产合计"等子串包含情况
+        sorted_items = sorted(self.ALL_ASSET_ITEMS, key=len, reverse=True)
+        for item in sorted_items:
             if line == item or line.startswith(item + " ") or line.endswith(item):
                 return item
             if item in line and len(line) < len(item) + 15:
@@ -559,14 +595,24 @@ class FinancialAnalysisExtractor(BaseExtractor):
                 continue
 
             is_new_item = False
+            num_line_clean = num_line
             if num_line:
+                # 截断数字行中的中文文本，防止数字与后续文字合并（如 "100.001、货币资金"）
+                chinese_pos = None
+                for match in re.finditer(r'[一-鿿]', num_line):
+                    chinese_pos = match.start()
+                    break
+                if chinese_pos is not None:
+                    num_line_clean = num_line[:chinese_pos]
+
                 for item in self.ALL_ASSET_ITEMS:
                     if num_line == item or (num_line.startswith(item) and len(num_line) < len(item) + 5):
                         is_new_item = True
                         break
                 if num_line in ["流动资产：", "非流动资产：", "流动资产", "非流动资产"]:
                     is_new_item = True
-                if len(num_line) > 4 and re.search(r'[一-鿿]', num_line):
+                # 检查清理后的行是否触发新项目（避免行尾中文误报）
+                if not is_new_item and len(num_line) > 4 and re.search(r'[一-鿿]', num_line):
                     for item in self.ALL_ASSET_ITEMS:
                         if item in num_line:
                             is_new_item = True
@@ -575,7 +621,7 @@ class FinancialAnalysisExtractor(BaseExtractor):
             if is_new_item:
                 break
 
-            nums = re.findall(r'[\d,]+\.?\d*', num_line)
+            nums = re.findall(r'[\d,]+\.?\d*', num_line_clean)
             if nums:
                 for num in nums:
                     clean_num = num.replace(',', '')

@@ -303,8 +303,9 @@ class BondTermsExtractor(BaseExtractor):
             return f"{match.group(1)}亿元", letter
 
         # 模式4：上证函/深证函...号...同意...不超过...（限制范围，业务规则：不超过50亿）
+        # 注意：[^\d]{0,30} 防止 . 贪婪匹配吃掉数字前缀（如 "5.6" 中的 "5."），避免只捕获到 "6"
         match = re.search(
-            r'[上深]证函.{0,150}同意.{0,80}不超过.{0,30}(\d+(?:\.\d+)?)\s*亿',
+            r'[上深]证函.{0,150}同意.{0,80}不超过[^\d]{0,30}(\d+(?:\.\d+)?)\s*亿',
             clean_text
         )
         if match and 0 < float(match.group(1)) <= 50:
@@ -329,8 +330,9 @@ class BondTermsExtractor(BaseExtractor):
             return f"{match.group(1)}亿元", ""
 
         # 模式7：注册[金额度]...不超过...（兜底，业务规则：不超过50亿且不少于1亿）
+        # 注意：.{0,100}? 非贪婪匹配，防止跳过第一个"不超过"导致错误的金额
         match = re.search(
-            r'注册[金额度]?.{0,100}不超过.*?(\d+(?:\.\d+)?)\s*亿',
+            r'注册[金额度]?.{0,100}?不超过.*?(\d+(?:\.\d+)?)\s*亿',
             clean_text
         )
         if match and 0 < float(match.group(1)) <= 50:
