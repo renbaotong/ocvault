@@ -577,6 +577,8 @@ class IssuerProfileExtractor(BaseExtractor):
             return ""
         value = re.sub(r'<[^>]+>', '', value)
         value = re.sub(r'\s+', ' ', value)
+        # 清除中文之间的空格（PDF逐字提取导致，如"强 村"→"强村"）
+        value = re.sub(r'([一-龥])\s+([一-龥])', r'\1\2', value)
         value = value.strip()
         return value
 
