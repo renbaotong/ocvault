@@ -50,7 +50,7 @@ class FundUsageExtractor(BaseExtractor):
         clean = self.full_text.replace('\n', '')
         decoded = self._decode_garbled_text(clean)
         all_usages = self._extract_all_usages(clean, decoded)
-        total_amount = self._extract_total_amount(clean, decoded)
+        total_amount = self._extract_total_amount(clean)
         return {
             "total_amount": total_amount,
             "all_usages": all_usages,
@@ -59,7 +59,15 @@ class FundUsageExtractor(BaseExtractor):
     def _extract_all_usages(self, clean: str, decoded: str) -> List[Dict[str, str]]:
         """提取所有资金用途及其金额"""
         usages = []
-        search_text = clean
+        # 优先使用章节文本，避免从财务报表等无关章节误提取
+        chapter_text = self._get_fund_chapter_clean_text()
+        if chapter_text:
+            decoded_chapter = self._decode_garbled_text(chapter_text)
+            search_text = decoded_chapter
+            search_text_raw = chapter_text
+        else:
+            search_text = decoded
+            search_text_raw = clean
 
         patterns = [
             r"扣除发行费用后[^\n]{0,20}?(\d+(?:,\d{3})*(?:\.\d+)?)\s*万元[^\n]{0,60}?用于[^\n]{0,50}?([^\n，。,，；]+)",
@@ -93,7 +101,9 @@ class FundUsageExtractor(BaseExtractor):
                         if not existing:
                             same_name = next((u for u in usages if u["name"] == usage_name), None)
                             if same_name:
-                                same_name["amount"] = round(same_name["amount"] + amount, 2)
+                                # 只有金额相近（差额<0.5亿）时才累加，避免不同口径数据叠加
+                                if abs(same_name["amount"] - amount) < 0.5:
+                                    same_name["amount"] = round(same_name["amount"] + amount, 2)
                             else:
                                 usages.append({"amount": amount, "name": usage_name})
                 except (ValueError, IndexError):
@@ -192,7 +202,7 @@ class FundUsageExtractor(BaseExtractor):
         return []
 
     def _find_fund_usage_page_range(self):
-        """用 PyMuPDF 找到募集资金运用章节的页面范围"""
+        """用 PyMuPDF 找到募集资金运用章节的页面范围（仅1-2页，用于汇总表提取）"""
         import fitz
         try:
             doc = fitz.open(self.pdf_path)
@@ -206,7 +216,6 @@ class FundUsageExtractor(BaseExtractor):
         for page_num in range(total_pages):
             page = doc[page_num]
             text = page.get_text()
-            # 只在正文范围内查找（跳过前15页的目录部分）
             if page_num < 15:
                 continue
             if start_page is None and any(kw in text for kw in ['第三节 募集资金运用', '第三节募集资金运用', '募集资金运用\n二', '募集资金的运用']):
@@ -218,12 +227,63 @@ class FundUsageExtractor(BaseExtractor):
 
         if not start_page:
             return None
-
         if end_page is None:
             end_page = total_pages
 
-        # 提取开始页和下一页（汇总表通常跨2页）
         return (start_page, min(start_page + 1, end_page))
+
+    def _find_fund_chapter_page_range(self):
+        """找到募集资金运用章节的完整页面范围（用于文本提取，避免匹配目录）"""
+        import fitz
+        try:
+            doc = fitz.open(self.pdf_path)
+        except Exception:
+            return None
+
+        start_page = None
+        end_page = None
+        total_pages = len(doc)
+
+        for page_num in range(total_pages):
+            page = doc[page_num]
+            text = page.get_text()
+            if page_num < 15:
+                continue
+            if start_page is None and any(kw in text for kw in ['第三节 募集资金运用', '第三节募集资金运用', '募集资金运用\n二', '募集资金的运用']):
+                start_page = page_num + 1
+            if start_page is not None and end_page is None and any(kw in text for kw in ['第四节 发行人', '第四节发行人']):
+                end_page = page_num
+
+        doc.close()
+
+        if not start_page:
+            return None
+        if end_page is None:
+            end_page = total_pages
+        if end_page <= start_page:
+            end_page = start_page + 1
+
+        return (start_page, end_page)
+
+    def _get_fund_chapter_clean_text(self) -> str:
+        """提取募集资金运用章节的清理文本，避免从财务报表等其他章节误提取数据"""
+        page_range = self._find_fund_chapter_page_range()
+        if not page_range:
+            return ""
+
+        start_page, end_page = page_range
+        # 提取章节所有页面的文本
+        chapter_text = self.extract_page_text(list(range(start_page - 1, end_page)))
+        chapter_clean = chapter_text.replace('\n', '')
+
+        # 裁剪到从"第三节 募集资金运用"等标题开始，排除前面的无关内容
+        for kw in ['第三节 募集资金运用', '第三节募集资金运用', '三、募集资金运用', '募集资金运用']:
+            idx = chapter_clean.find(kw)
+            if idx >= 0:
+                chapter_clean = chapter_clean[idx:]
+                break
+
+        return chapter_clean
 
     def _parse_summary_table_rows(self, table) -> List[Dict[str, str]]:
         """解析单个汇总表的数据行
@@ -371,7 +431,7 @@ class FundUsageExtractor(BaseExtractor):
 
         return clean[start_idx:end_idx]
 
-    def _extract_total_amount(self, clean: str, decoded: str) -> str:
+    def _extract_total_amount(self, clean: str) -> str:
         cover_text = ""
         if self.doc:
             for i in range(min(5, len(self.doc))):
@@ -379,9 +439,11 @@ class FundUsageExtractor(BaseExtractor):
         cover_clean = cover_text.replace('\n', '') if cover_text else ""
 
         patterns = [
-            r"本期债券发行规模[为是]?\s*(\d+(?:\.\d+)?)\s*亿",
-            r"本期债券发行金额[为是]?\s*(\d+(?:\.\d+)?)\s*亿",
-            r"本期发行规模[为是]?\s*(\d+(?:\.\d+)?)\s*亿",
+            r"本期债券发行规模[为是]?\s*(?:人民币)?\s*(\d+(?:\.\d+)?)\s*亿",
+            r"本期债券发行金额[为是]?\s*(?:人民币)?\s*(\d+(?:\.\d+)?)\s*亿",
+            r"本期债券发行总额[不超过为是]*\s*(?:人民币)?\s*(\d+(?:\.\d+)?)\s*亿",
+            r"本期发行规模[为是]?\s*(?:人民币)?\s*(\d+(?:\.\d+)?)\s*亿",
+            r"本期债券发行面值总额[^亿]*?(\d+(?:\.\d+)?)\s*亿",
         ]
 
         for pattern in patterns:
@@ -477,14 +539,14 @@ class FundUsageExtractor(BaseExtractor):
                     info["issue_scale"] = total_amount
 
         if not info["issue_scale"]:
-            info["issue_scale"] = self._read_registration_scale_from_bond_terms()
-
-        if not info["issue_scale"]:
             for pattern in [
                 r"本期债券发行面值总额不超过[人民币]*(\d+(?:\.\d+)?)\s*亿元",
-                r"本期债券发行规模[为是]?\s*(\d+(?:\.\d+)?)\s*亿元",
-                r"本期发行金额.*?(\d+(?:\.\d+)?)\s*亿",
-                r"本期债券发行[规模金额]+[为是]?\s*(\d+(?:\.\d+)?)\s*亿",
+                r"本期债券发行规模[为是]?\s*(?:人民币)?\s*(\d+(?:\.\d+)?)\s*亿元",
+                r"本期债券发行金额[为是]?\s*(?:人民币)?\s*(\d+(?:\.\d+)?)\s*亿元",
+                r"本期债券发行总额[不超过为是]*\s*(?:人民币)?\s*(\d+(?:\.\d+)?)\s*亿元",
+                r"本期发行规模[为是]?\s*(?:人民币)?\s*(\d+(?:\.\d+)?)\s*亿元",
+                r"本期发行金额.*?(?:人民币)?\s*(\d+(?:\.\d+)?)\s*亿",
+                r"本期债券发行[规模金额]+[为是]?\s*(?:人民币)?\s*(\d+(?:\.\d+)?)\s*亿",
                 r"发行总额不超过(\d+(?:\.\d+)?)\s*亿元",
                 r"发行规模.*?(\d+(?:\.\d+)?)\s*亿",
             ]:
@@ -494,6 +556,9 @@ class FundUsageExtractor(BaseExtractor):
                     if 1 <= val <= 50:
                         info["issue_scale"] = f"{val} 亿元"
                         break
+
+        if not info["issue_scale"]:
+            info["issue_scale"] = self._read_registration_scale_from_bond_terms()
 
         guarantee_match = re.search(r"(?:担保方式|增信方式).*?(?:保证担保|抵押担保|质押担保|信用)", clean)
         if guarantee_match:
