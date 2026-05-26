@@ -477,11 +477,14 @@ class FundUsageExtractor(BaseExtractor):
                     info["issue_scale"] = total_amount
 
         if not info["issue_scale"]:
+            info["issue_scale"] = self._read_registration_scale_from_bond_terms()
+
+        if not info["issue_scale"]:
             for pattern in [
                 r"本期债券发行面值总额不超过[人民币]*(\d+(?:\.\d+)?)\s*亿元",
                 r"本期债券发行规模[为是]?\s*(\d+(?:\.\d+)?)\s*亿元",
                 r"本期发行金额.*?(\d+(?:\.\d+)?)\s*亿",
-                r"本期债券发行.*?(\d+(?:\.\d+)?)\s*亿元",
+                r"本期债券发行[规模金额]+[为是]?\s*(\d+(?:\.\d+)?)\s*亿",
                 r"发行总额不超过(\d+(?:\.\d+)?)\s*亿元",
                 r"发行规模.*?(\d+(?:\.\d+)?)\s*亿",
             ]:
@@ -491,9 +494,6 @@ class FundUsageExtractor(BaseExtractor):
                     if 1 <= val <= 50:
                         info["issue_scale"] = f"{val} 亿元"
                         break
-
-        if not info["issue_scale"]:
-            info["issue_scale"] = self._read_registration_scale_from_bond_terms()
 
         guarantee_match = re.search(r"(?:担保方式|增信方式).*?(?:保证担保|抵押担保|质押担保|信用)", clean)
         if guarantee_match:
