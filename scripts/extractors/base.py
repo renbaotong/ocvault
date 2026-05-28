@@ -264,8 +264,8 @@ class BaseExtractor:
         name = re.sub(r'^\d{2}[\u4e00-\u9fa5]+.*?[）)]', '', name)
         name = re.sub(r'^[）):：]', '', name)
 
-        # 提取年份前的内容作为发行人
-        match = re.match(r'(.*?)(20\d{2}年)', name)
+        # 提取年份前的内容作为发行人（年份与"年"之间可能有空格）
+        match = re.match(r'(.*?)(20\d{2})\s*年', name)
         if match:
             self._issuer_name = match.group(1).strip()
         else:
@@ -305,8 +305,8 @@ class BaseExtractor:
         period_match = re.search(r'（第 [一二三四五] 期）', name)
         period = period_match.group(0) if period_match else ""
 
-        # 提取年份
-        year_match = re.search(r'(20\d{2}年)', name)
+        # 提取年份（年份与"年"之间可能有空格）
+        year_match = re.search(r'(20\d{2})\s*年', name)
         year = year_match.group(0) if year_match else ""
 
         self._bond_info = BondInfo(

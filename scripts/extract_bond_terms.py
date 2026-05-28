@@ -192,7 +192,11 @@ class BondTermsExtractor(BaseExtractor):
         info["guarantee"] = self._extract_guarantee(clean, cover_text)
 
         info["credit_rating"] = self.find_pattern(
-            [r"发行人主体信用等级 [为：:]?\s*([A-Z][A-Z\+\-]+)", r"主体评级.*?([A-Z][A-Z\+\-]+)"],
+            [
+                r"发行人[的]?主体信用等级[为：:]?\s*([A-Z][A-Z\+]+)",
+                r"主体信用[级等].{0,20}?([A-Z][A-Z\+]+)",
+                r"主体评级[为：:]?\s*([A-Z][A-Z\+]+)",
+            ],
             clean
         )
 
