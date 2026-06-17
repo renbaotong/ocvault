@@ -83,7 +83,8 @@ class FinancialAnalysisExtractor(BaseExtractor):
     ]
     # 所有资产项目
     ALL_ASSET_ITEMS = FLOW_ITEMS + NON_FLOW_ITEMS + [
-        "流动资产合计", "非流动资产合计", "资产总计", "资产合计"
+        "流动资产合计", "非流动资产合计", "资产总计", "资产合计",
+        "流动资产", "非流动资产",
     ]
 
     def __init__(self, pdf_path: str):
@@ -160,9 +161,10 @@ class FinancialAnalysisExtractor(BaseExtractor):
                     break
 
             if not has_asset_table:
-                # HTML模式可能丢失中文，回退使用纯文本检测
+                # HTML模式可能丢失中文（中文被编码为HTML实体后部分丢失），
+                # 始终使用纯文本进行关键词检测，避免资产结构页面被漏检
                 plain_text = page.get_text()
-                detect_text = text if any(kw in text for kw in ["货币", "资产"]) else plain_text
+                detect_text = plain_text
 
                 flow_keywords = ["货币资金", "应收账款", "预付款项", "其他应收款", "存货"]
                 non_flow_keywords = ["固定资产", "在建工程", "无形资产", "长期股权投资"]
@@ -182,6 +184,7 @@ class FinancialAnalysisExtractor(BaseExtractor):
             target_pages = []
             best_header_page = -1
             best_header_score = 0
+            all_valid_pages = set()
             for page_num in range(min(30, len(self.doc)), len(self.doc)):
                 page = self.doc[page_num]
                 plain_text = page.get_text()
@@ -236,7 +239,10 @@ class FinancialAnalysisExtractor(BaseExtractor):
                         if not has_amount_ratio_header:
                             break  # 这是资产负债表，跳过
 
-                        # 评分
+                        # 记录为有效页面（收集所有有效页面，不限于最佳评分）
+                        all_valid_pages.add(page_num)
+
+                        # 评分（用于日志输出和信息展示）
                         score = len(unique_items) * 3
                         if has_amount_ratio_header:
                             score += 30  # 资产结构表的关键特征
@@ -244,15 +250,15 @@ class FinancialAnalysisExtractor(BaseExtractor):
                             score += 10
                         if "流动资产合计" in plain_text and "非流动资产合计" in plain_text:
                             score += 5
-                        # 分数相同时优先选前面的页面
-                        if score > best_header_score or (score == best_header_score and best_header_page < 0):
+                        if score > best_header_score:
                             best_header_score = score
                             best_header_page = page_num
                         break
 
-            if best_header_page > 0:
-                target_pages.append(best_header_page)
-                print(f"  通过表格头找到最佳资产表格，页面 {best_header_page+1} (得分={best_header_score})")
+            if all_valid_pages:
+                target_pages = sorted(all_valid_pages)
+                print(f"  通过表头扫描找到 {len(target_pages)} 个有效页面: {[p+1 for p in target_pages]}"
+                      f" (最佳: 第{best_header_page+1}页, 得分={best_header_score})")
 
             # 策略2：如果表格头扫描未找到，尝试标题+内容匹配
             if not target_pages:
@@ -365,44 +371,38 @@ class FinancialAnalysisExtractor(BaseExtractor):
         return self._extract_simple_totals(result)
 
     def _select_contiguous_pages(self, target_pages: List[int]) -> List[int]:
-        """选择连续的页面组，优先选择包含最多资产项目的组"""
+        """选择连续的页面组，合并所有组为一个连续页面列表"""
         if not target_pages:
             return []
 
-        # 找出所有连续页面组
+        # 找出所有连续页面组（连续2页以内视为一组）
         groups = []
         current_group = [target_pages[0]]
         for i in range(1, len(target_pages)):
             if target_pages[i] - target_pages[i-1] <= 2:
                 current_group.append(target_pages[i])
             else:
-                if len(current_group) > 1:
-                    groups.append(list(current_group))
+                groups.append(list(current_group))
                 current_group = [target_pages[i]]
-        if len(current_group) > 1:
-            groups.append(list(current_group))
+        groups.append(list(current_group))
 
-        # 如果有连续组，选择第一个组并扩展
-        if groups:
-            selected = groups[0]
-        else:
-            # 没有连续页面，选择第一个页面
-            selected = [target_pages[0]]
+        # 对每个组进行前后扩展，然后合并
+        all_expanded = set()
+        for group in groups:
+            expanded = list(group)
+            # 向后扩展至多12页
+            last_page = group[-1]
+            for offset in range(1, 12):
+                next_p = last_page + offset
+                if next_p < len(self.doc):
+                    expanded.append(next_p)
+            # 向前扩展1页
+            first_page = group[0]
+            if first_page > 0:
+                expanded.append(first_page - 1)
+            all_expanded.update(expanded)
 
-        # 向后扩展以包含跨页表格
-        expanded = list(selected)
-        last_page = selected[-1]
-        for offset in range(1, 12):
-            next_p = last_page + offset
-            if next_p < len(self.doc) and next_p not in expanded:
-                expanded.append(next_p)
-
-        # 向前扩展1页（资产结构表可能从前一页开始）
-        first_page = selected[0]
-        if first_page > 0 and (first_page - 1) not in expanded:
-            expanded.insert(0, first_page - 1)
-
-        selected = sorted(set(expanded))[:10]
+        selected = sorted(all_expanded)[:20]
 
         print(f"  选择页面: {[p+1 for p in selected]} 进行表格提取")
         return selected
@@ -635,12 +635,19 @@ class FinancialAnalysisExtractor(BaseExtractor):
 
     def _add_asset_item(self, result: Dict, item_name: str, values: List[Dict], current_section: str):
         if "合计" in item_name or "总计" in item_name:
-            if "流动资产合计" in item_name and not result.get("flow_total"):
+            if item_name == "流动资产合计":
+                # 明细表的"合计"行具有权威的占比(100%)，覆盖概览表的简写版本
                 result["flow_total"] = values
-            elif "非流动资产合计" in item_name and not result.get("non_flow_total"):
+            elif item_name == "非流动资产合计":
                 result["non_flow_total"] = values
             elif item_name in ["资产总计", "资产合计"] and not result.get("total"):
                 result["total"] = values
+        elif item_name == "流动资产" and not result.get("flow_total"):
+            # 处理省略"合计"的简写形式（如概览表中项目名为"流动资产"而非"流动资产合计"）
+            # 仅当明细表的"流动资产合计"尚未设置时使用
+            result["flow_total"] = values
+        elif item_name == "非流动资产" and not result.get("non_flow_total"):
+            result["non_flow_total"] = values
         else:
             existing_names = [x["name"] for x in result.get("flow_assets", [])] + \
                             [x["name"] for x in result.get("non_flow_assets", [])]
@@ -1171,8 +1178,11 @@ class FinancialAnalysisExtractor(BaseExtractor):
 
         num_periods = len(years[:3])
         has_flow = len(data.get("flow_assets", [])) > 0
+        has_non_flow = len(data.get("non_flow_assets", [])) > 0
+        has_flow_total = len(data.get("flow_total", [])) > 0
+        has_non_flow_total = len(data.get("non_flow_total", [])) > 0
         has_total = len(data.get("total", [])) > 0
-        if not has_flow and not has_total:
+        if not has_flow and not has_non_flow and not has_flow_total and not has_non_flow_total and not has_total:
             return "详见募集说明书原文"
 
         header = "| 项目"
