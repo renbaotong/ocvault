@@ -1253,9 +1253,26 @@ class FinancialAnalysisExtractor(BaseExtractor):
 
 
 def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(description="资产结构分析提取")
+    parser.add_argument("--files", nargs="*", default=None,
+                        help="指定要处理的PDF文件名（多个用空格隔开），不指定则处理raw/下所有PDF")
+    args = parser.parse_args()
+
     raw_dir = "raw"
     knowledge_dir = "knowledge"
-    pdf_files = [f for f in os.listdir(raw_dir) if f.endswith(".pdf")]
+
+    if args.files:
+        pdf_files = [f for f in args.files if f.endswith(".pdf")]
+        for f in pdf_files:
+            fp = os.path.join(raw_dir, f)
+            if not os.path.exists(fp):
+                print(f"[警告] 文件不存在，跳过：{fp}")
+        pdf_files = [f for f in pdf_files if os.path.exists(os.path.join(raw_dir, f))]
+    else:
+        pdf_files = [f for f in os.listdir(raw_dir) if f.endswith(".pdf")]
+
     print(f"发现 {len(pdf_files)} 份 PDF 文件\n")
     for pdf_file in pdf_files:
         pdf_path = os.path.join(raw_dir, pdf_file)

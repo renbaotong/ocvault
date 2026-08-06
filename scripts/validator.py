@@ -179,42 +179,63 @@ class RevenueSumChecker:
     @staticmethod
     def check(content: str, issuer: str) -> List[ValidationIssue]:
         issues = []
-        # 查找营业收入表格中的合计行
         lines = content.split('\n')
         in_revenue_section = False
         header_found = False
+        pct_col_indices = set()  # 表头中标记为"占比"的列索引
+        total_rows = []  # 收集所有"合计"行
 
         for line in lines:
             if '营业收入' in line and '###' in line:
                 in_revenue_section = True
                 header_found = False
+                pct_col_indices = set()
+                total_rows = []
                 continue
             if in_revenue_section and line.startswith('###'):
-                in_revenue_section = False
-                continue
+                break  # 离开营业收入小节，停止处理
             if in_revenue_section and '|' in line:
                 cells = [c.strip() for c in line.split('|')[1:-1]]
                 if not header_found:
                     header_found = True
+                    # 识别表头中哪些列是"占比"列
+                    for col_idx, cell in enumerate(cells):
+                        if '占比' in cell:
+                            pct_col_indices.add(col_idx)
+                    # 如果没有占比列（如纯金额表），跳过校验
+                    if not pct_col_indices:
+                        break
                     continue
                 if '合计' in line:
-                    # 检查占比列是否接近 100%
-                    for col_idx in range(2, len(cells), 2):
-                        if col_idx < len(cells):
-                            pct_str = cells[col_idx].replace('%', '').strip()
-                            try:
-                                pct = float(pct_str)
-                                if abs(pct - 100) > 1:
-                                    issues.append(ValidationIssue(
-                                        issuer=issuer,
-                                        note_type="business_analysis",
-                                        rule=RevenueSumChecker.RULE_NAME,
-                                        severity="error",
-                                        message=f"营业收入占比合计={pct}%，不等于100%"
-                                    ))
-                            except ValueError:
-                                pass
-                    break
+                    total_rows.append(cells)
+
+        # 确定正确的合计行：
+        # 优先找"营业收入合计"或"营业收入总计"行（开封文旅场景：多个合计行时取总合计）
+        target_row = None
+        for row in total_rows:
+            if row and ('营业收入合计' in row[0] or '营业收入总计' in row[0]):
+                target_row = row
+                break
+        # 未找到则取最后一个"合计"行（标准场景：只有一个"合计"行）
+        if target_row is None and total_rows:
+            target_row = total_rows[-1]
+
+        if target_row:
+            for col_idx in sorted(pct_col_indices):
+                if col_idx < len(target_row):
+                    pct_str = target_row[col_idx].replace('%', '').strip()
+                    try:
+                        pct = float(pct_str)
+                        if abs(pct - 100) > 1:
+                            issues.append(ValidationIssue(
+                                issuer=issuer,
+                                note_type="business_analysis",
+                                rule=RevenueSumChecker.RULE_NAME,
+                                severity="error",
+                                message=f"营业收入占比合计={pct}%，不等于100%"
+                            ))
+                    except ValueError:
+                        pass
 
         return issues
 

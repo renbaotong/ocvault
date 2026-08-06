@@ -37,6 +37,8 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
 
     def __init__(self, pdf_path: str):
         super().__init__(pdf_path)
+        # 存储从毛利率表中移除的成本合计行，用于追加到成本表
+        self._removed_cost_rows: List[List[str]] = []
 
     def extract_revenue_table(self) -> Dict[str, str]:
         """
@@ -456,6 +458,14 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
         if any(kw in prev_last_row_text for kw in terminal_markers):
             return False
 
+        # 新增：阻止合并人员信息表（董事、监事、高级管理人员等）
+        # 人员信息表的表头包含"姓名"、"职务"等关键词，不应与财务数据表合并
+        if prev_table and prev_table[0]:
+            prev_header_text = ' '.join([(c or '').strip() for c in prev_table[0]]).lower()
+            personnel_keywords = ['姓名', '现任职务', '高级管理人员', '董监高', '人员设置']
+            if any(kw in prev_header_text for kw in personnel_keywords):
+                return False
+
         # 检查当前页第一行是否为表头行（重复表头的跨页情况）
         curr_first_row_text = ' '.join([c or '' for c in curr_table[0]])
         # 同时检查前两行的 header 指标（有些表头跨两行）
@@ -652,7 +662,22 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
         if very_large_count >= 5:
             return True
 
-        # 二次检查：处理 亿元-unit 表格（所有数值都很小，< 1000）
+        # 二次检查：检查合计行是否有大数值（合计行通常比各业务行大数倍）
+        total_values = []
+        for row in table:
+            row_text = ' '.join([c or '' for c in row])
+            if '合计' in row_text or '总计' in row_text:
+                for cell in row[1:]:
+                    if cell and cell.strip() not in ('-', '', '%'):
+                        try:
+                            val = float(cell.replace(',', '').replace('%', '').strip())
+                            total_values.append(val)
+                        except:
+                            pass
+        if total_values and any(abs(v) > 500 for v in total_values):
+            return True
+
+        # 三次检查：处理 亿元-unit 表格（所有数值都很小，< 1000）
         # 如果表头包含"毛利润"（非"毛利率"）且有"金额/占比"列结构，
         # 则是毛利润金额表而非毛利率百分比表
         header_text = ' '.join([' '.join(row) for row in table[:4]]).lower()
@@ -660,6 +685,22 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
         has_amount_pct_cols = '金额' in header_text and '占比' in header_text
         if has_gross_profit_header and has_amount_pct_cols:
             return True
+
+        # 四次检查：表头有"金额/占比"列结构，且数据行有>=2个>300的值，则是金额表（非毛利率表）
+        # 毛利率百分比表只有业务板块名+年份列，不会有"金额"/"占比"列
+        if has_amount_pct_cols:
+            large_count = 0
+            for row in table[2:]:
+                for cell in row[1:]:
+                    if cell and cell.strip() not in ('-', '', '%'):
+                        try:
+                            val = float(cell.replace(',', '').replace('%', '').strip())
+                            if abs(val) > 300:
+                                large_count += 1
+                        except:
+                            pass
+            if large_count >= 2:
+                return True
 
         return False
 
@@ -681,13 +722,18 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
             if not row:
                 continue
             first_cell = (row[0] or '').strip()
+            all_cells_text = ' '.join([(c or '').strip() for c in row])
             rest_empty = all(not (c or '').strip() for c in row[1:])
 
+            # 标准情况：分隔行在第一列
             if rest_empty and len(first_cell) < 15:
                 if '营业成本' in first_cell and '收入' not in first_cell:
                     split_points.append((idx, 'cost'))
-                elif '营业毛利率' in first_cell or '营业毛利润' in first_cell or first_cell.strip() in ('毛利率', '毛利润'):
+                elif ('营业毛利率' in first_cell or '营业毛利润' in first_cell or
+                      '毛利润及毛利率构成' in first_cell or '毛利润及毛利率' in first_cell or
+                      first_cell.strip() in ('毛利率', '毛利润')):
                     split_points.append((idx, 'margin'))
+
 
         if not split_points:
             return result
@@ -698,6 +744,7 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
             result['revenue'] = table[:first_split_idx]
 
         # 各个分隔点之间是成本表和毛利率表
+
         for sp_idx in range(len(split_points)):
             section_type = split_points[sp_idx][1]
             start_idx = split_points[sp_idx][0]
@@ -1245,6 +1292,11 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
                             if target_type == 'cost' and not has_cost_context:
                                 # 页面没有成本上下文，跳过 cost 分配
                                 continue
+                            # 防止将毛利率/毛利润表错误分配给营业成本
+                            if target_type == 'cost':
+                                table_all_text = ' '.join([' '.join(row) for row in table]).lower()
+                                if '毛利率' in table_all_text or '综合毛利率' in table_all_text or '毛利润' in table_all_text:
+                                    continue
                             if not result[target_type]:
                                 result[target_type] = self._format_table_to_markdown_v3(table)
                                 print(f"  识别到 {target_type} 表格 (同页多表顺序, 第{page_num + 1}页)")
@@ -1273,6 +1325,8 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
                         if sub_table and len(sub_table) >= 2 and not result[section_type]:
                             result[section_type] = self._format_table_to_markdown_v3(sub_table)
                             print(f"  识别到 {section_type} 表格 (拆分大表格, 第{page_num + 1}页)")
+                    # 拆分后的表格标记为已处理，防止后续继续处理
+                    table_info['_pre_assigned'] = True
                 else:
                     # 预过滤：检查是否为期间费用表（销售费用、管理费用、财务费用等）
                     # 这类表格绝不应被误判为 revenue 表（即使包含"营业收入"字样）
@@ -1433,6 +1487,26 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
             has_rev_ctx = '营业收入' in page_text_lower
             has_cost_ctx = '营业成本' in page_text_lower
 
+            # 对于乱码PDF，同时检查表格数据中的业务关键词
+            if not has_rev_ctx or not has_cost_ctx:
+                # 收集所有表格的文本（用于乱码PDF的关键词检测）
+                all_table_text = []
+                for tinfo in page_tables:
+                    for row in tinfo['table'][:3]:
+                        for cell in row:
+                            if cell:
+                                all_table_text.append(str(cell))
+                table_text_all = ' '.join(all_table_text).lower()
+                if not has_rev_ctx:
+                    has_rev_ctx = ('收入' in table_text_all and '金额' in table_text_all)
+                if not has_cost_ctx:
+                    has_cost_ctx = ('成本' in table_text_all and '金额' in table_text_all)
+                # 如果表格有"业务板块+金额+占比"列结构，说明是业务分析页面
+                has_business_structure = ('业务' in table_text_all and '金额' in table_text_all and '占比' in table_text_all)
+                if has_business_structure:
+                    if not has_rev_ctx and not has_cost_ctx:
+                        has_rev_ctx = True  # 有业务板块+金额+占比结构的初步判定为营业收入表
+
             if has_rev_ctx or has_cost_ctx:
                 # 提取各表格的业务名称和表头（仅比较真正的表头行，不包含数据行）
                 table_sigs = []
@@ -1537,8 +1611,47 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
                     if result.get('cost'):
                         break
 
-        # ===== 兜底：当任何结果字段为空时，重新扫描所有表格进行直接分类 =====
-        if not result.get('revenue') or not result.get('cost') or not result.get('margin'):
+        # ===== 兜底 for 乱码PDF：直接使用列结构和数据特征判断表格类型 =====
+        # 当关键字匹配失败时（乱码PDF），用列数和金额数据特征识别
+        # 如果 revenue 为空而 margin 不为空，说明可能是乱码PDF导致的误判，清除margin重建
+        _garbled_done = False
+        if not result.get('revenue') and result.get('margin'):
+            result['margin'] = ''
+        if not result.get('revenue') or not result.get('margin'):
+            for pn, ti, tbl, pt, si in page_data:
+                if result.get('revenue') and result.get('margin'):
+                    break
+                cols = len(tbl[0]) if tbl and tbl[0] else 0
+                rows = len(tbl)
+                if cols < 5 or rows < 5:
+                    continue
+                all_txt = ' '.join([' '.join(row) for row in tbl]).lower()
+                # 排除明显不相关的表格
+                if any(kw in all_txt for kw in ['现金流量', '筹资活动', '资产负债', '货币资金', '净利润', '借款', '关联方']):
+                    continue
+                # 统计千分位格式数字数量（收入/成本表有大量金额数据）
+                _comma_cnt = 0
+                for row in tbl[2:]:
+                    for cell in row:
+                        if cell and ',' in str(cell) and re.search(r'\d{1,3},\d{3}', str(cell)):
+                            _comma_cnt += 1
+                if _comma_cnt < 5:
+                    continue
+                # 按列数分配类型
+                if cols in (6, 7, 8) and not result.get('revenue'):
+                    result['revenue'] = self._format_table_to_markdown_v3(tbl)
+                    _garbled_done = True
+                    print(f"  识别到 revenue 表格 (列结构判定, 第{pn + 1}页)")
+                elif cols in (9, 10, 11) and not result.get('margin'):
+                    result['margin'] = self._format_table_to_markdown_v3(tbl)
+                    _garbled_done = True
+                    print(f"  识别到 margin 表格 (列结构判定, 第{pn + 1}页)")
+
+		# ===== 兜底：当任何结果字段为空时，重新扫描所有表格进行直接分类 =====
+        if _garbled_done and result.get('revenue') and result.get('margin'):
+            # 乱码PDF兜底已完成（revenue+margin均已获取），跳过
+            pass
+        elif not result.get('revenue') or not result.get('cost') or not result.get('margin'):
             # 构建已填充的类型集合
             filled_types = {k for k, v in result.items() if v}
             needed_types = {'revenue', 'cost', 'margin'} - filled_types
@@ -1607,12 +1720,32 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
                                               ('收入' in header_text_scan and '占比' in header_text_scan and '成本' not in header_text_scan)
                     has_cost_header_scan = '成本' in header_text_scan and '收入' not in header_text_scan and '毛利率' not in header_text_scan
                     has_margin_header_scan = '毛利率' in header_text_scan
+                    # 对于乱码PDF，使用%符号检测毛利率表
+                    percent_count_scan = sum(1 for row in data_rows_scan[:10] for cell in row[1:]
+                                             if cell and '%' in str(cell))
+                    has_margin_pct = percent_count_scan >= 3
 
-                    if has_margin_header_scan and 'margin' in needed_types:
-                        result['margin'] = self._format_table_to_markdown_v3(table)
-                        needed_types.discard('margin')
-                        print(f"  [兜底] 识别到 margin 表格 (第{page_num + 1}页)")
-                        continue
+                    # 排除"收入+成本+毛利率"三列综合表（不应归为毛利率表）
+                    is_triplet_scan = ('收入' in header_text_scan and '成本' in header_text_scan and
+                                      '毛利率' in header_text_scan)
+
+                    if (has_margin_header_scan or has_margin_pct) and 'margin' in needed_types and not is_triplet_scan:
+                        # 优先使用%符号指示的毛利率表（长春新区详细毛利率表）
+                        if has_margin_pct:
+                            result['margin'] = self._format_table_to_markdown_v3(table)
+                            needed_types.discard('margin')
+                            print(f"  [兜底] 识别到 margin 表格(%判定, 第{page_num + 1}页)")
+                            continue
+                        # 仅在无%表时使用字符串匹配
+                        has_pct_elsewhere = any(
+                            '%' in str(c) for _, _, tb, _, _ in page_data
+                            for row in tb[2:5] for c in row if c and isinstance(c, str)
+                        )
+                        if not has_pct_elsewhere:
+                            result['margin'] = self._format_table_to_markdown_v3(table)
+                            needed_types.discard('margin')
+                            print(f"  [兜底] 识别到 margin 表格 (第{page_num + 1}页)")
+                            continue
 
                     # 当页面包含"毛利润"/"毛利率"且 cost 仍为空位时，
                     # 说明该页面可能同时包含收入表和成本表，
@@ -1705,6 +1838,16 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
 
         # 获取数据区域
         data_rows = table[2:] if len(table) > 2 else []
+
+        # ===== 前置检查：排除"收入+成本+毛利率"三列综合表 =====
+        # 这种是收入/成本/毛利率汇总表，不应归为单独的毛利率表
+        # 必须在任何margin判定之前执行
+        _header_has_rev = '收入' in header_text
+        _header_has_cost = '成本' in header_text
+        _header_has_margin_kw = '毛利率' in header_text or '毛利润' in header_text
+        if _header_has_rev and _header_has_cost and _header_has_margin_kw:
+            # 三列综合表（收入+成本+毛利率），这是汇总表不用于分类
+            return None
 
         # ===== 第一步：排除明确不相关的表格 =====
 
@@ -1820,12 +1963,13 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
             return None
 
         # 排除17：物业/资产明细表（包含面积、价格、开工时间等非财务指标）
+        # 注意：'项目名称'/'序号' 等通用表头也用于财务表，故需排除含"收入/成本+占比"财务结构的表格
         has_property_detail = any(kw in all_text for kw in [
             '可出租面积', '出租价格', '出租率', '出租方式',
             '开工时间', '总投资额', '已投资额', '预计可租面积',
             '预计租金', '取得方式', '受让面积', '使用年限',
             '项目名称', '房屋名称', '序号',
-        ]) and not re.search(r'业务板块|业务名称|金额.*占比', all_text)
+        ]) and not re.search(r'业务板块|业务名称|金额.*占比|收入.*占比|成本.*占比', all_text)
         if has_property_detail:
             return None
 
@@ -1902,6 +2046,29 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
         has_income_summary = all(kw in all_text for kw in ['税金及附加', '期间费用', '营业利润']) and \
                              not re.search(r'业务板块|业务名称|分板块', all_text)
         if has_income_summary:
+            return None
+
+        # 排除25：董监高人员信息表（姓名、性别、出生年份、现任职务等）
+        has_personnel_names = all(kw in all_text for kw in ['姓名', '性别', '现任职务']) or \
+                             all(kw in all_text for kw in ['姓名', '性别', '出生年份']) or \
+                             all(kw in all_text for kw in ['姓名', '性别', '职务'])
+        has_personnel_numeric = bool(re.search(r'19[56789]\d', all_text))  # 出生年份 1950s-1990s
+        if has_personnel_names and has_personnel_numeric:
+            return None
+
+        # 排除26：企业名册/子公司列表表（含大量企业名称，且表头无财务结构）
+        # 典型：控股子公司名册（序号/企业名称/注册地/行业/注册资本/持股比例），
+        # 其表头常被 PyMuPDF 截断，无法命中"子公司+注册资本"等关键词，需通过企业名称密度识别。
+        # 注意：表头含金额/占比/年份/收入成本结构时视为财务表，不排除。
+        entity_count = 0
+        for row in data_rows[:15]:
+            for cell in row:
+                if cell and re.search(r'[一-龥A-Za-z]+(?:有限公司|有限责任公司|股份有限公司|集团有限公司|股份公司|集团)$', cell.strip()):
+                    entity_count += 1
+        header_has_financial = ('金额' in header_text or '占比' in header_text or
+                                bool(re.search(r'202[2345]', header_text)) or
+                                ('收入' in header_text and '成本' in header_text))
+        if entity_count >= 3 and not header_has_financial:
             return None
 
         # ===== 第1.5步：基于表格标题行的强分类信号 =====
@@ -2007,20 +2174,28 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
             if self._is_gross_profit_amount_table(table):
                 return "cost" if not result.get('cost') else None
 
+        # 排除"收入+成本+毛利率"三列同时出现的综合表（长春新区场景）
+        # 表头同时包含"收入"、"成本"、"毛利率"三列标题时，
+        # 说明是收入/成本/毛利率汇总表，不应归为单独的毛利率表
+        header_has_rev = '收入' in header_text
+        header_has_cost = '成本' in header_text
+        header_has_margin_kw = '毛利率' in header_text or '毛利润' in header_text
+        is_triplet_table = header_has_rev and header_has_cost and header_has_margin_kw
+
         # 毛利率表：必须包含"毛利率"关键词（表格内或表头）
         # 注意：排除"毛利润"（金额表）+ "金额/占比"结构的情况
-        if has_margin_header or has_margin:
-            # "毛利润" in header_text 且表格有"金额/占比"列结构 → 是毛利润金额表，不是毛利率百分比表
-            header_has_profit_not_margin = ('毛利润' in header_text and '毛利率' not in header_text)
-            if header_has_profit_not_margin:
-                has_amt_pct = ('金额' in header_text and '占比' in header_text)
-                if has_amt_pct:
-                    # 这是毛利润金额表，不归为 margin
-                    pass
+        if not is_triplet_table and (has_margin_header or has_margin):
+                # "毛利润" in header_text 且表格有"金额/占比"列结构 → 是毛利润金额表，不是毛利率百分比表
+                header_has_profit_not_margin = ('毛利润' in header_text and '毛利率' not in header_text)
+                if header_has_profit_not_margin:
+                    has_amt_pct = ('金额' in header_text and '占比' in header_text)
+                    if has_amt_pct:
+                        # 这是毛利润金额表，不归为 margin
+                        pass
+                    else:
+                        return "margin"
                 else:
                     return "margin"
-            else:
-                return "margin"
 
         # 辅助判断：页面包含"毛利率"且表格特征符合（少列、小数值、无千分位）
         # 排除：带"业务板块"列的表格（这是收入/成本分板块表，不是毛利率百分比表）
@@ -2063,6 +2238,17 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
                         break
                 if all_pct and pct_count >= 2 and has_small_decimals:
                     return "margin"
+
+        # 毛利率表检测（支持乱码PDF）：表中有%符号的数据行，且列数<=5，无千分位逗号
+        # 乱码PDF中毛利率和毛利润关键词不可读，但%符号可以明确指示毛利率表
+        if percent_count >= 3 and not has_comma_numbers and num_cols <= 7:
+            # 进一步验证：数据行为大数值(毛利润)+百分比(毛利率)交替
+            has_business_seg = has_business_column or any(
+                row and row[0] and len(row[0].strip()) >= 2
+                for row in data_rows[:5]
+            )
+            if has_business_seg:
+                return "margin"
 
         # 营业收入表：表头含"营业收入"，有金额数据，有业务分类
         if has_revenue_header and (has_comma_numbers or has_numeric_values) and (comma_count + numeric_count) >= 3:
@@ -2217,23 +2403,285 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
                     return "revenue"
 
         # 兜底2：页面上下文明确表明是收入/成本/毛利率表格
+        # 增加列数过滤：至少5列才可能是主营业务表格，防止物业租赁表等误判
         if has_revenue_in_page and has_numeric_values and numeric_count >= 2 and not has_cost and not has_margin:
-            if not result.get('revenue'):
-                return "revenue"
-            # 当 revenue 已填充但 cost 仍空缺，且当前表格有业务板块+金额结构，
-            # 通常是成本/毛利润表（叠石桥场景：同一页面两个结构相似表格）
-            elif not result.get('cost') and has_business_column and has_comma_numbers:
-                return "cost"
+            if num_cols >= 5:
+                if not result.get('revenue'):
+                    return "revenue"
+                # 当 revenue 已填充但 cost 仍空缺，且当前表格有业务板块+金额结构，
+                # 通常是成本/毛利润表（叠石桥场景：同一页面两个结构相似表格）
+                elif not result.get('cost') and has_business_column and has_comma_numbers:
+                    return "cost"
         if has_cost_in_page and has_numeric_values and numeric_count >= 2 and not has_revenue:
-            if not result.get('cost'):
-                return "cost"
+            if num_cols >= 5:
+                if not result.get('cost'):
+                    return "cost"
         if has_margin_in_page and has_numeric_values and numeric_count >= 2 and not has_revenue and not has_cost:
             # 确保不是毛利润金额表
             if not self._is_gross_profit_amount_table(table):
-                if not result.get('margin'):
-                    return "margin"
+                # 排除包含"金额/占比"列结构的表格（这是收入/成本/毛利润表的特征，不是毛利率百分比表）
+                has_amount_pct_structure = '金额' in header_text and '占比' in header_text
+                if has_amount_pct_structure:
+                    pass  # 金额/占比结构 → 不是毛利率表，跳过
+                else:
+                    # 列数过滤：至少5列才可能是毛利率表（防止物业租赁表等误判）
+                    if num_cols >= 5:
+                        if not result.get('margin'):
+                            return "margin"
+
+        # 兜底3：基于列数和数值特征的表格识别（适用于乱码PDF/关键字匹配失败的场景）
+        # 当表格有多个含金额的数据行且rev/cost关键字均未命中时，用列数判断
+        # 8列 = 序号+项目+3年×(金额+占比) → 营业收入表
+        # 11列 = 序号+项目+3年×(毛利润+毛利率+占比) → 毛利率表
+        if (comma_count + numeric_count) >= 3 and not has_revenue and not has_cost:
+            # 排除"收入+成本"组合拆分表（如细分板块收入/成本拆分），不应归为毛利率表
+            _is_combined_rev_cost = '收入' in header_text and '成本' in header_text
+            if num_cols in (6, 7, 8) and not result.get('revenue') and not _is_combined_rev_cost:
+                return "revenue"
+            elif num_cols in (9, 10, 11) and not result.get('margin') and not _is_combined_rev_cost:
+                return "margin"
 
         return None
+
+    def _fix_income_cost_margin_triplet(self, table: List[List[str]]) -> List[List[str]]:
+        """
+        修复"收入/成本/毛利率"三列结构的多余列问题。
+        适用场景（如长春新区）：PyMuPDF 将合并单元格拆成 28 列，
+        实际逻辑结构为 项目 + 3年×(收入+成本+毛利率)。
+        """
+        if not table or len(table) < 3:
+            return table
+
+        header_text = ' '.join(str(c) for c in (table[0] + (table[1] if len(table) > 1 else [])))
+        if '收入' not in header_text or '成本' not in header_text or '毛利率' not in header_text:
+            return table
+        if '202' not in header_text:
+            return table
+
+        # 检查第一行或第二行是否包含"收入/成本/毛利率"三列标签
+        triplet_labels = {'收入', '成本', '毛利率'}
+        years_found = []
+        # 找到年份位置
+        row0 = [str(c or '') for c in (table[0] if table[0] else [])]
+        row1 = [str(c or '') for c in (table[1] if len(table) > 1 else [])]
+
+        year_positions = {}  # col -> year_str
+        for ci, cell in enumerate(row0):
+            m = re.search(r'(20\d\d(?:\s*年(?:\s*1[-\s]?\d\s*月)?)?)', cell)
+            if m:
+                year_str = m.group(1).strip()
+                year_positions[ci] = year_str
+
+        # 如果没有找到足够的年份位置（至少2年），返回
+        if len(year_positions) < 2:
+            return table
+
+        # 找到三列标签位置
+        label_positions = {}  # col -> label (收入/成本/毛利率)
+        for ci in range(max(len(row0), len(row1))):
+            cell0 = row0[ci] if ci < len(row0) else ''
+            cell1 = row1[ci] if ci < len(row1) else ''
+            for label in triplet_labels:
+                if label in cell0 or label in cell1:
+                    # 该列在表头中有标签，直接使用（合并单元格可能导致数据列偏移）
+                    label_positions[ci] = label
+
+        if len(label_positions) < 3:
+            return table
+
+        # 为每个年月创建数据列映射
+        # 首先将年份分配到每组三列
+        sorted_years = sorted(year_positions.items())
+        sorted_labels = sorted(label_positions.items())
+
+        # 按顺序分组：每N年的一组标签，每组标签按顺序分配给对应的年份
+        # 假设每个年份有相同的标签组（收入/成本/毛利率）
+        n_years = len(sorted_years)
+        if len(sorted_labels) % n_years != 0:
+            # 标签数不能整除年数，使用边界法
+            year_boundaries = []
+            for i, (ycol, ystr) in enumerate(sorted_years):
+                if i + 1 < len(sorted_years):
+                    next_col = sorted_years[i + 1][0]
+                    boundary = (ycol + next_col) // 2
+                else:
+                    boundary = max(lc for lc, _ in sorted_labels) + 1
+                year_boundaries.append((ycol, boundary, ystr))
+        else:
+            # 标签数等于年数×3（收入+成本+毛利率），按顺序分组
+            labels_per_year = len(sorted_labels) // n_years
+            year_boundaries = []
+            for i, (ycol, ystr) in enumerate(sorted_years):
+                if i + 1 < n_years:
+                    next_label_idx = (i + 1) * labels_per_year
+                    next_col = sorted_labels[next_label_idx][0] if next_label_idx < len(sorted_labels) else ycol + 10
+                    boundary = next_col
+                else:
+                    boundary = max(lc for lc, _ in sorted_labels) + 1
+                year_boundaries.append((ycol, boundary, ystr))
+
+        # 使用区间划分分配标签
+        year_label_map = {}  # year_str -> {'收入': col, '成本': col, '毛利率': col}
+        for lcol, label in sorted_labels:
+            assigned = False
+            for start, end, ystr in year_boundaries:
+                if start <= lcol < end:
+                    if ystr not in year_label_map:
+                        year_label_map[ystr] = {}
+                    year_label_map[ystr][label] = lcol
+                    assigned = True
+                    break
+            if not assigned:
+                best_yr = min(year_positions.values(),
+                              key=lambda y: abs(lcol - next(c for c, ys in year_positions.items() if ys == y)))
+                if best_yr not in year_label_map:
+                    year_label_map[best_yr] = {}
+                year_label_map[best_yr][label] = lcol
+
+        # 只保留有至少2列标签的年份
+        complete_years = [(y, m) for y, m in year_label_map.items() if len(m) >= 2]
+        if len(complete_years) < 2:
+            return table
+
+        # 重构表头：第一列为项目名，后续为 year-label 组合
+        header_cols = ['项目']
+        for year_str, mapping in complete_years:
+            for label in ['收入', '成本', '毛利率']:
+                if label in mapping:
+                    header_cols.append(f'{year_str} {label}' if label else year_str)
+
+        # 重构数据行
+        result = [header_cols]
+        for ri in range(len(table)):
+            row = list(table[ri])
+            # 跳过表头行（前两行）
+            if ri < 2:
+                continue
+            # 跳过全空行
+            if not any(c and str(c).strip() for c in row):
+                continue
+            # 检测该行是否存在列偏移（合并单元格导致）
+            # 检查第一个数据列（第一年的收入列）是否为空，而前一列有数据
+            row_offset = 0
+            first_year = complete_years[0][0]
+            first_mapping = complete_years[0][1]
+            first_label_col = first_mapping.get('收入') or first_mapping.get('成本') or min(first_mapping.values())
+            if first_label_col is not None and first_label_col < len(row):
+                expected_val = str(row[first_label_col] or '').strip()
+                if not expected_val or not re.search(r'\d', expected_val):
+                    # 检查前一列是否有数据
+                    if first_label_col > 0:
+                        prev_val = str(row[first_label_col - 1] or '').strip()
+                        if prev_val and re.search(r'\d', prev_val):
+                            row_offset = -1
+
+            new_row = []
+            # 项目名列 - col 0为主，col 1仅在col 0为空时作为子项目名
+            col0_val = str(row[0] or '').strip() if len(row) > 0 else ''
+            col1_val = str(row[1] or '').strip() if len(row) > 1 else ''
+            if col0_val and not re.search(r'\d', col0_val):
+                # col 0有项目名，单独使用
+                new_row.append(col0_val)
+            elif col1_val and not re.search(r'\d', col1_val):
+                # col 0为空或包含数字，使用col 1的项目名
+                new_row.append(col1_val)
+            else:
+                new_row.append(col0_val or col1_val)
+            # 各年(收入/成本/毛利率)列
+            for year_str, mapping in complete_years:
+                for label in ['收入', '成本', '毛利率']:
+                    if label in mapping:
+                        col_idx = mapping[label]
+                        # 应用列偏移（合并单元格导致的数据偏移）
+                        actual_col = col_idx + row_offset
+                        if actual_col >= 0 and actual_col < len(row):
+                            cell = str(row[actual_col] or '').strip() if actual_col < len(row) else ''
+                        else:
+                            cell = ''
+                        new_row.append(cell)
+            result.append(new_row)
+
+        return result
+
+    def _fix_merged_cell_column_offsets(self, table):
+        """
+        修复合并单元格导致的列偏移问题。
+        检测每行数据的实际列偏移量并调整为统一结构。
+        """
+        if not table or len(table) < 3:
+            return table
+
+        num_cols = max(len(row) for row in table)
+
+        # 找到年份列位置（从表头中）
+        year_cols = []  # [(col_idx, year_str), ...]
+        for ri in range(min(2, len(table))):
+            row = table[ri]
+            for ci in range(min(num_cols, len(row))):
+                cell = (row[ci] or '').strip()
+                if re.search(r'(20\d\d)', cell):
+                    if ci not in [yc for yc, _ in year_cols]:
+                        year_cols.append((ci, cell))
+
+        if len(year_cols) < 2:
+            return table
+
+        # 找到大部分行的"标准"数据起始列
+        data_start_candidates = {}
+        for ri in range(2, len(table)):
+            row = list(table[ri]) + [''] * (num_cols - len(table[ri]))
+            # 找到第一个包含数字的数据列
+            for ci in range(1, min(8, num_cols)):
+                cell = (row[ci] or '').strip()
+                if re.search(r'\d', cell) and not re.match(r'^20\d\d', cell):
+                    data_start_candidates[ci] = data_start_candidates.get(ci, 0) + 1
+                    break
+
+        if not data_start_candidates:
+            return table
+
+        # 标准数据起始列 = 出现最多的起始列
+        standard_start = max(data_start_candidates, key=data_start_candidates.get)
+
+        # 检查并修复偏移行
+        result = [table[0], table[1]] if len(table) > 1 else [table[0]]
+        for ri in range(2, len(table)):
+            row = list(table[ri]) + [''] * (num_cols - len(table[ri]))
+            row_text = ' '.join(str(c or '') for c in row)
+            # 如果行包含表头关键词，跳过
+            if any(kw in row_text for kw in ['202', '金额', '占比', '业务板块名称', '项目']):
+                result.append(row)
+                continue
+
+            # 检查该行的数据起始列
+            row_start = -1
+            for ci in range(1, min(8, num_cols)):
+                cell = (row[ci] or '').strip()
+                if re.search(r'\d', cell) and not re.match(r'^20\d\d', cell):
+                    row_start = ci
+                    break
+
+            if row_start > standard_start:
+                # 该行数据偏移了
+                shift = row_start - standard_start
+                # 将行名移到 col 0
+                new_row = ['' for _ in range(num_cols)]
+                # 先合并所有非空的名
+                name_parts = []
+                for ci in range(min(shift + 1, num_cols)):
+                    cell = (row[ci] or '').strip()
+                    if cell and not re.search(r'^\d', cell):
+                        name_parts.append(cell)
+                new_row[0] = ' '.join(name_parts)
+                # 数据列左移
+                for ci in range(standard_start, num_cols - shift):
+                    if ci + shift < num_cols:
+                        new_row[ci] = row[ci + shift]
+                result.append(new_row)
+            else:
+                result.append(row)
+
+        return result
 
     def _restructure_period_table(self, table: List[List[str]]) -> List[List[str]]:
         """
@@ -2400,6 +2848,105 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
             result.append([padded[c] for c in keep])
         return result
 
+    def _filter_investment_income_rows(self, table: List[List[str]]) -> List[List[str]]:
+        """
+        过滤投资收益行：当营业收入表中混入了"投资收益"子表数据时，
+        移除从表头到"投资收益合计"行的所有行。
+
+        适用场景（如深圳福田）：同一页面同时包含"投资收益"明细和"营业收入"明细，
+        PyMuPDF 将两者合并为一张大表，需拆分开来。
+        """
+        if not table or len(table) < 2:
+            return table
+
+        # 检查表头是否包含"投资收益"
+        header_text = ' '.join(table[0]).strip()
+        has_investment_header = '投资收益' in header_text
+
+        if not has_investment_header:
+            return table
+
+        # 找到"投资收益合计"行的位置（投资数据结束行）
+        investment_end_row = -1
+        for i, row in enumerate(table):
+            row_text = ' '.join([c or '' for c in row])
+            if '投资收益合计' in row_text:
+                investment_end_row = i
+                break
+
+        if investment_end_row >= 0:
+            # 从"投资收益合计"下一行开始才是真正的营业收入数据
+            # 跳过投资收益段（包含表头到合计行）
+            return table[investment_end_row + 1:]
+        else:
+            # 没有找到合计行，检查首行是否明确标识为投资收益表
+            if '项目' in header_text and '投资收益' in header_text:
+                # 可能整个表都是投资收益，尝试找"营业收入"关键词作为分界线
+                for i, row in enumerate(table):
+                    row_text = ' '.join([c or '' for c in row])
+                    if '营业收入' in row_text and i > 0:
+                        return table[i:]
+            return table
+
+    def _remove_cost_total_rows_from_table(self, table):
+        """
+        从包含成本合计行的毛利率表中移除成本合计行（针对乱码PDF）。
+        使用结构性检测：寻找col 0为空且其余列仅1-2个非空文本单元格的行，
+        该行很可能是数据段之间的分隔标题行。
+        """
+        if not table or len(table) < 5:
+            return table
+
+        # 查找分隔标题行：col 0为空，其余列只有1-2个非空文本单元格
+        divider_idx = -1
+        for ri in range(2, len(table)):
+            row = table[ri]
+            col0 = (row[0] or '').strip() if len(row) > 0 else ''
+            if col0:
+                continue  # col 0有内容，不是分隔行
+            # 统计其余列的非空单元格
+            other_non_empty = []
+            for ci in range(1, len(row)):
+                cell = (row[ci] or '').strip()
+                if cell:
+                    other_non_empty.append((ci, cell))
+            # 分隔行特征：col 0为空，其余只有1-3个非空单元格，且不含数字
+            if 1 <= len(other_non_empty) <= 3:
+                all_text = all(not re.search(r'\d', ct) for _, ct in other_non_empty)
+                if all_text:
+                    # 验证：该行之前有财务数据行，之后也有数据行
+                    prev_has_data = False
+                    if ri >= 2:
+                        for check_row in table[max(0, ri-3):ri]:
+                            check_text = ' '.join([str(c or '') for c in check_row])
+                            if re.search(r'\d', check_text):
+                                prev_has_data = True
+                                break
+                    next_has_data = False
+                    if ri + 1 < len(table):
+                        for check_row in table[ri+1:min(len(table), ri+4)]:
+                            check_text = ' '.join([str(c or '') for c in check_row])
+                            if re.search(r'\d', check_text):
+                                next_has_data = True
+                                break
+                    if prev_has_data and next_has_data:
+                        divider_idx = ri
+                        break
+
+        if divider_idx > 0:
+            # 保存被移除的成本合计行，用于后续追加到成本表
+            removed = table[:divider_idx]
+            if len(removed) >= 2:
+                # 验证移除的行确实是成本相关数据（有数字、占比结构）
+                removed_text = ' '.join([' '.join([str(c or '') for c in row]) for row in removed])
+                if re.search(r'\d', removed_text):
+                    self._removed_cost_rows = removed
+
+            # 从分隔行开始保留（分隔行本身可能是标题，保留以便查看）
+            table = table[divider_idx:]
+
+        return table
+
     def _format_table_to_markdown_v3(self, table: List[List[str]]) -> str:
         """
         将表格转换为 Markdown 格式 v4.0
@@ -2408,7 +2955,28 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
         if not table or len(table) < 2:
             return ""
 
-        # 尝试重组多年度金额/占比表格（去除多余空列）
+        # 过滤混入的"投资收益"行（仅影响含投资收益表头的表格）
+        table = self._filter_investment_income_rows(table)
+        if not table or len(table) < 2:
+            return ""
+
+        # 修复合并单元格导致的列偏移问题（在重组前执行）
+        # 注意：此功能可能会导致少量占比数据丢失，目前暂时禁用
+        # table = self._fix_merged_cell_column_offsets(table)
+        # if not table or len(table) < 2:
+        #     return ""
+
+        # 移除表格前部可能混入的成本合计行（重庆秀城场景）
+        table = self._remove_cost_total_rows_from_table(table)
+        if not table or len(table) < 2:
+            return ""
+
+        # 修复"收入/成本/毛利率"三列结构的多余列问题
+        # 必须在 _restructure_period_table 之前执行
+        table = self._fix_income_cost_margin_triplet(table)
+        if not table or len(table) < 2:
+            return ""
+
         # 尝试重组多年度金额/占比表格（去除多余空列）
         table = self._restructure_period_table(table)
         # 移除全空列（pdfplumber 常产生多余空列）
@@ -2466,6 +3034,87 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
 
         return "\n".join(lines)
 
+    def _filter_margin_triplet_to_margin_only(self, margin_md: str) -> str:
+        """
+        过滤"收入/成本/毛利率"三列表中的毛利率表。
+        当毛利率表包含"收入"或"成本"列时（表明来自三列表），
+        仅保留包含"毛利率"的列。
+        """
+        if not margin_md:
+            return margin_md
+
+        lines = margin_md.split('\n')
+        if len(lines) < 3:
+            return margin_md
+
+        # 检查第一行（表头）是否包含"收入"或"成本"（表明是三列表）
+        header_line = lines[0]
+        has_revenue_col = '收入' in header_line
+        has_cost_col = '成本' in header_line
+        has_margin_col = '毛利率' in header_line or '毛利润' in header_line
+
+        if not (has_revenue_col or has_cost_col) or not has_margin_col:
+            return margin_md
+
+        # 找到包含"毛利率"列的索引
+        cols = header_line.split('|')
+        margin_col_indices = set()
+        for ci, col in enumerate(cols):
+            if '毛利率' in col or '毛利润' in col:
+                margin_col_indices.add(ci)
+
+        # 找到"项目"列（第一列）
+        project_col_indices = set()
+        for ci, col in enumerate(cols):
+            stripped = col.strip()
+            if stripped in ('项目', '业务板块名称', '业务名称', '类别'):
+                project_col_indices.add(ci)
+        if not margin_col_indices:
+            return margin_md
+
+        # 确定要保留的列：项目列（通常是col 0）+ 毛利率列
+        # 在markdown表格中，空列（col 0之前）不计数
+        # 项目列通常是第一个非空列
+        keep_indices = set()
+        # 找到第一个有内容的列作为项目列
+        for ci, col in enumerate(cols):
+            if col.strip():
+                keep_indices.add(ci)
+                break
+        # 添加毛利率列
+        keep_indices.update(margin_col_indices)
+
+        if len(keep_indices) < 2:
+            return margin_md
+
+        # 过滤每行
+        new_lines = []
+        for line in lines:
+            if not line.startswith('|'):
+                new_lines.append(line)
+                continue
+            parts = line.split('|')
+            # 保存前导空字符串（表起始）
+            new_parts = [parts[0]] if parts else ['']
+            for ci in range(1, min(len(parts), len(cols))):
+                if ci in keep_indices:
+                    # 补齐new_parts到长度ci
+                    while len(new_parts) <= ci:
+                        new_parts.append('')
+                    new_parts[ci] = parts[ci]
+            # 确保所有保留列都有对应的值
+            result_parts = [new_parts[0]]
+            for ci in sorted(keep_indices):
+                if ci < len(new_parts):
+                    result_parts.append(new_parts[ci])
+                else:
+                    result_parts.append('')
+            new_lines.append('|'.join(result_parts))
+
+        # 确保分隔行有正确的列数
+        result = '\n'.join(new_lines)
+        return result
+
     def generate_note(self, output_base: str) -> str:
         """生成主营业务分析笔记"""
         info = {
@@ -2489,6 +3138,21 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
         revenue_section = self._format_table_section(tables.get("revenue"), "营业收入")
         cost_section = self._format_table_section(tables.get("cost"), "营业成本")
         margin_section = self._format_table_section(tables.get("margin"), "毛利率")
+
+        # 追加从毛利率表中移除的成本合计行到营业成本表（重庆秀城场景）
+        if self._removed_cost_rows and len(self._removed_cost_rows) >= 2:
+            cost_total_md = self._format_table_to_markdown_v3(self._removed_cost_rows)
+            if cost_total_md:
+                # 如果已有成本数据，追加；否则替换占位符
+                if cost_section and '详见募集说明书原文' not in cost_section:
+                    cost_section += '\n' + cost_total_md
+                else:
+                    cost_section = cost_total_md
+
+        # 如果毛利率表包含"收入"/"成本"列（来自收入/成本/毛利率三列表），
+        # 需过滤为仅保留毛利率列（长春新区场景）
+        if margin_section and '详见募集说明书原文' not in margin_section:
+            margin_section = self._filter_margin_triplet_to_margin_only(margin_section)
 
         template = f"""{frontmatter}
 # {info['issuer']} - 主营业务
@@ -2528,10 +3192,26 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
 
 def main():
     """主函数"""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="主营业务分析提取")
+    parser.add_argument("--files", nargs="*", default=None,
+                        help="指定要处理的PDF文件名（多个用空格隔开），不指定则处理raw/下所有PDF")
+    args = parser.parse_args()
+
     raw_dir = "raw"
     knowledge_dir = "knowledge"
 
-    pdf_files = [f for f in os.listdir(raw_dir) if f.endswith(".pdf")]
+    if args.files:
+        pdf_files = [f for f in args.files if f.endswith(".pdf")]
+        for f in pdf_files:
+            fp = os.path.join(raw_dir, f)
+            if not os.path.exists(fp):
+                print(f"[警告] 文件不存在，跳过：{fp}")
+        pdf_files = [f for f in pdf_files if os.path.exists(os.path.join(raw_dir, f))]
+    else:
+        pdf_files = [f for f in os.listdir(raw_dir) if f.endswith(".pdf")]
+
     print(f"发现 {len(pdf_files)} 份 PDF 文件\n")
 
     for pdf_file in pdf_files:

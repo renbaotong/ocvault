@@ -441,41 +441,9 @@ class BondTermsExtractor(BaseExtractor):
         if match:
             return f"{match.group(1)}亿元"
 
-        # 模式 3d：发行规模...不超过 X 亿元（限制距离，避免跨段落匹配）
-        match = re.search(
-            r'发行规模.{0,60}不超过[人民币\s]*(\d+(?:\.\d+)?)\s*亿元',
-            clean_text
-        )
-        if match:
-            return f"{match.group(1)}亿元"
-
-        # 模式 3c：发行金额...不超过 X 亿元（限制距离）
-        match = re.search(
-            r'发行金额.{0,60}不超过[人民币\s]*(\d+(?:\.\d+)?)\s*亿元',
-            clean_text
-        )
-        if match:
-            return f"{match.group(1)}亿元"
-
         # 模式 2：发行规模...本期债券...不超过 X 亿元（限制距离）
         match = re.search(
             r'发行规模.{0,200}本期债券.{0,50}不超过[人民币\s]*(\d+(?:\.\d+)?)\s*亿',
-            clean_text
-        )
-        if match:
-            return f"{match.group(1)}亿元"
-
-        # 模式 3：发行规模...不超过 X 亿元（含 X 亿元）
-        match = re.search(
-            r'发行规模.{0,60}不超过[人民币\s]*(\d+(?:\.\d+)?)\s*亿元[？(（] 含',
-            clean_text
-        )
-        if match:
-            return f"{match.group(1)}亿元"
-
-        # 模式 3b：发行金额...不超过 X 亿元（含 X 亿元）
-        match = re.search(
-            r'发行金额.{0,60}不超过[人民币\s]*(\d+(?:\.\d+)?)\s*亿元[？(（] 含',
             clean_text
         )
         if match:
@@ -585,14 +553,6 @@ class BondTermsExtractor(BaseExtractor):
         if match:
             return f"{match.group(1)}亿元"
 
-        # 模式 12：直接匹配"XX 债券发行规模不超过 X 亿元"
-        match = re.search(
-            r'债券发行规模\s*不超过[人民币\s]*(\d+(?:\.\d+)?)\s*亿',
-            clean_text
-        )
-        if match:
-            return f"{match.group(1)}亿元"
-
         # ====== 以下是有品种（多品种）债券的提取逻辑 ======
         # 放在后面，因为上面的通用模式可能更精确
 
@@ -629,6 +589,48 @@ class BondTermsExtractor(BaseExtractor):
             if match:
                 total = float(match.group(1)) + float(match.group(2))
                 return f"{total}亿元"
+
+        # ====== 以下为无"本期/本次"前缀的宽泛模式（作为最后兜底）======
+
+        # 模式 3d：发行规模...不超过 X 亿元（限制距离，避免跨段落匹配）
+        match = re.search(
+            r'发行规模.{0,60}不超过[人民币\s]*(\d+(?:\.\d+)?)\s*亿元',
+            clean_text
+        )
+        if match:
+            return f"{match.group(1)}亿元"
+
+        # 模式 3c：发行金额...不超过 X 亿元（限制距离）
+        match = re.search(
+            r'发行金额.{0,60}不超过[人民币\s]*(\d+(?:\.\d+)?)\s*亿元',
+            clean_text
+        )
+        if match:
+            return f"{match.group(1)}亿元"
+
+        # 模式 3：发行规模...不超过 X 亿元（含 X 亿元）
+        match = re.search(
+            r'发行规模.{0,60}不超过[人民币\s]*(\d+(?:\.\d+)?)\s*亿元[？(（] 含',
+            clean_text
+        )
+        if match:
+            return f"{match.group(1)}亿元"
+
+        # 模式 3b：发行金额...不超过 X 亿元（含 X 亿元）
+        match = re.search(
+            r'发行金额.{0,60}不超过[人民币\s]*(\d+(?:\.\d+)?)\s*亿元[？(（] 含',
+            clean_text
+        )
+        if match:
+            return f"{match.group(1)}亿元"
+
+        # 模式 12：直接匹配"XX 债券发行规模不超过 X 亿元"
+        match = re.search(
+            r'债券发行规模\s*不超过[人民币\s]*(\d+(?:\.\d+)?)\s*亿',
+            clean_text
+        )
+        if match:
+            return f"{match.group(1)}亿元"
 
         return ""
 
@@ -979,10 +981,27 @@ class BondTermsExtractor(BaseExtractor):
 
 def main():
     """主函数"""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="发行条款提取")
+    parser.add_argument("--files", nargs="*", default=None,
+                        help="指定要处理的PDF文件名（多个用空格隔开），不指定则处理raw/下所有PDF")
+    args = parser.parse_args()
+
     raw_dir = "raw"
     knowledge_dir = "knowledge"
 
-    pdf_files = [f for f in os.listdir(raw_dir) if f.endswith(".pdf")]
+    if args.files:
+        pdf_files = [f for f in args.files if f.endswith(".pdf")]
+        # 检查文件是否存在
+        for f in pdf_files:
+            fp = os.path.join(raw_dir, f)
+            if not os.path.exists(fp):
+                print(f"[警告] 文件不存在，跳过：{fp}")
+        pdf_files = [f for f in pdf_files if os.path.exists(os.path.join(raw_dir, f))]
+    else:
+        pdf_files = [f for f in os.listdir(raw_dir) if f.endswith(".pdf")]
+
     print(f"发现 {len(pdf_files)} 份 PDF 文件\n")
 
     for pdf_file in pdf_files:

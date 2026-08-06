@@ -39,10 +39,11 @@ class BatchRunner:
         ("validator.py", "数据校验"),
     ]
 
-    def __init__(self, base_dir: str = None):
+    def __init__(self, base_dir: str = None, files: list = None):
         self.base_dir = base_dir or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         self.scripts_dir = os.path.join(self.base_dir, "scripts")
         self.results: List[TaskResult] = []
+        self.files = files  # 指定处理的PDF文件列表，None表示全部
 
     def run_script(self, script_name: str) -> TaskResult:
         """运行单个脚本"""
@@ -60,6 +61,7 @@ class BatchRunner:
 
         try:
             # 导入并运行主函数
+            import argparse
             import importlib.util
             spec = importlib.util.spec_from_file_location(
                 script_name.replace('.py', ''),
@@ -69,7 +71,16 @@ class BatchRunner:
             spec.loader.exec_module(module)
 
             if hasattr(module, 'main'):
-                module.main()
+                # 构造 sys.argv 传入 --files 参数
+                old_argv = sys.argv
+                if self.files:
+                    sys.argv = [script_name, "--files"] + self.files
+                else:
+                    sys.argv = [script_name]
+                try:
+                    module.main()
+                finally:
+                    sys.argv = old_argv
                 return TaskResult(
                     script=script_name,
                     success=True,
@@ -112,6 +123,13 @@ class BatchRunner:
         self.results = []
 
         for script_name, description in self.SCRIPTS:
+            # 指定了 --files 时，跳过索引生成和校验（它们不接受 --files 参数）
+            if self.files and script_name in ("generate_meta_index.py", "validator.py"):
+                print(f"\n[{len(self.results) + 1}/{len(self.SCRIPTS)}] "
+                      f"{description}: {script_name}")
+                print("-" * 40)
+                print(f"[SKIP] 指定 --files 时跳过")
+                continue
             print(f"\n[{len(self.results) + 1}/{len(self.SCRIPTS)}] "
                   f"{description}: {script_name}")
             print("-" * 40)
@@ -120,9 +138,9 @@ class BatchRunner:
             self.results.append(result)
 
             if result.success:
-                print(f"✓ 成功 ({result.duration:.2f}s)")
+                print(f"[OK] 成功 ({result.duration:.2f}s)")
             else:
-                print(f"✗ 失败：{result.error}")
+                print(f"[FAIL] 失败：{result.error}")
                 if not skip_errors:
                     print("\n处理中止")
                     break
@@ -162,9 +180,13 @@ def main():
         action="store_true",
         help="跳过错误的脚本继续执行"
     )
+    parser.add_argument(
+        "--files", nargs="*", default=None,
+        help="指定要处理的PDF文件名（多个用空格隔开），不指定则处理raw/下所有PDF"
+    )
     args = parser.parse_args()
 
-    runner = BatchRunner()
+    runner = BatchRunner(files=args.files)
     results = runner.run_all(skip_errors=args.skip_errors)
 
     # 返回错误码
