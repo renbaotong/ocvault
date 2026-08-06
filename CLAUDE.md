@@ -44,7 +44,7 @@ ocvault/
 | `extract_issuer_profile.py` | 03-发行人基本情况 | 注册名称、资本、实缴资本、设立日期、经营范围、股权结构 |
 | `extract_business_analysis.py` | 04-主营业务分析 | 营业收入、营业成本、毛利率分板块表格 |
 | `extract_financial_analysis.py` | 05-资产结构分析 | 资产构成（流动资产/非流动资产/资产总计） |
-| `run_all.py` | — | 批量运行以上 5 个脚本 + 生成索引 |
+| `run_all.py` | — | 批量运行以上 5 个脚本 + 生成索引；>3 份募集说明书时自动并行（≤3 并发），`--no-parallel` 强制串行 |
 | `generate_meta_index.py` | 00-Meta/ | 生成发行人索引和债券索引笔记 |
 
 ## 使用方法
@@ -53,8 +53,11 @@ ocvault/
 # 处理新募集说明书
 cp new_prospectus.pdf raw/
 
-# 方式一：批量运行所有提取脚本
+# 方式一：批量运行所有提取脚本（>3 份募集说明书时自动并行，同一时刻最多 3 份）
 python scripts/run_all.py
+
+# 强制串行（调试用）
+python scripts/run_all.py --no-parallel
 
 # 方式二：单独运行某个脚本
 python scripts/extract_bond_terms.py
@@ -92,3 +95,4 @@ pip install paddlepaddle paddleocr
 2. 财务数字需人工校验
 3. 增量更新：新 PDF 放入 raw/ 后重新运行 `run_all.py`
 4. **禁止使用** `extract_prospectus.py`（已废弃，改用模块化脚本）
+5. `run_all.py` 处理 >3 份募集说明书时自动并行：每份 PDF 在独立子进程中按原顺序跑完 5 个提取脚本，同一时刻最多 3 份，不改变提取逻辑；`--no-parallel` 可强制回到串行模式（索引生成与数据校验始终在所有提取完成后整体运行）
