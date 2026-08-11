@@ -39,6 +39,10 @@ class FinancialAnalysisExtractor(BaseExtractor):
         r"表[：:]?报告期各期末资产结构情况",
         r"表[：:]?近两年及一期末资产结构详细表",
         r"表[：:]?近两年及一期末发行人资产结构情况",
+        r"最近两年发行人资产结构情况",
+        r"最近两年及一期发行人资产结构情况",
+        r"最近两年末发行人资产结构情况",
+        r"近两年发行人资产结构情况",
         # 章节+表格标题格式
         r"一[、.\s]*资产结构分析",
         r"[（(]一[）)]\s*资产结构分析",
@@ -198,7 +202,7 @@ class FinancialAnalysisExtractor(BaseExtractor):
                         year_matches = re.findall(r'202\d', next_lines)
                         if len(set(year_matches)) < 2:
                             break
-                        if not re.search(r'202\d.*[年月]', next_lines):
+                        if not re.search(r'202\d.*[年月末]', next_lines):
                             break
 
                         # 检查表格开头的项目是否为资产结构项目（而非明细子项或合计行）
@@ -227,13 +231,13 @@ class FinancialAnalysisExtractor(BaseExtractor):
                         has_amount_ratio_header = False
                         for j in range(i+1, min(i+12, len(lines))):
                             l = lines[j]
-                            if l in ["金额", "占比"]:
+                            if l in ["金额", "占比"] or l.startswith("占资产总额") or l == "比例":
                                 has_amount_ratio_header = True
                                 break
-                        # 也检查"项目"和年份之间是否有占比
+                        # 也检查"项目"和年份之间是否有占比/占资产总额
                         if not has_amount_ratio_header:
                             header_section = ' '.join(lines[i:i+10])
-                            if '占比' in header_section:
+                            if '占比' in header_section or '占资产总额' in header_section or '比例' in header_section:
                                 has_amount_ratio_header = True
 
                         if not has_amount_ratio_header:

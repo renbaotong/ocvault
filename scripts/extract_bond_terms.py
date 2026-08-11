@@ -61,24 +61,13 @@ class BondTermsExtractor(BaseExtractor):
         info["register_scale"], info["approval_letter"] = self._extract_register_scale(clean)
 
         # 如果注册规模提取成功但没有获取到函号，尝试独立提取函号
+        # 仅匹配 上证函/深证函，避免误匹配"保证函"等
         if info["register_scale"] and not info["approval_letter"]:
-            letter_match = re.search(r'(?:[上深]|.{0,3})证函[^号]*号', clean)
-            if letter_match:
-                info["approval_letter"] = letter_match.group(0)
-            else:
-                letter_match = re.search(r'证函[^号]*号', clean)
-                if letter_match:
-                    info["approval_letter"] = letter_match.group(0)
+            info["approval_letter"] = self._extract_approval_letter(clean)
 
         # 如果注册规模未提取到但存在函号，仍应记录函号
         if not info["register_scale"]:
-            letter_match = re.search(r'(?:[上深]|.{0,3})证函[^号]*号', clean)
-            if letter_match:
-                info["approval_letter"] = letter_match.group(0)
-            else:
-                letter_match = re.search(r'证函[^号]*号', clean)
-                if letter_match:
-                    info["approval_letter"] = letter_match.group(0)
+            info["approval_letter"] = self._extract_approval_letter(clean)
 
         # 优先在章节范围内提取本期发行规模，如果章节文本太短或未找到则回退到全文
         search_text = section_text if len(section_text) > 5000 else clean
@@ -214,6 +203,11 @@ class BondTermsExtractor(BaseExtractor):
 
     def _extract_register_scale(self, clean_text: str) -> tuple:
         """提取注册规模（从无异议函）"""
+        # 模式-1: 通过"无异议函/上证函/深证函/注册"上下文定位注册金额和函号（最可靠）
+        result = self._extract_register_from_context(clean_text)
+        if result:
+            return result
+
         # 模式0: 精确查找"注册规模为人民币 X 亿元"（最优先）
         match = re.search(
             r'注册规模为人民币\s*(\d+(?:\.\d+)?)\s*亿',
@@ -326,8 +320,9 @@ class BondTermsExtractor(BaseExtractor):
             return f"{match.group(1)}亿元", "已获取无异议函"
 
         # 模式6：同意...发行...不超过...（业务规则：不超过50亿）
+        # 使用负向断言排除"投资者...视作同意..."的风险提示语境
         match = re.search(
-            r'同意.*?发行.*?不超过.*?(\d+(?:\.\d+)?)\s*亿',
+            r'(?<!视作)同意.*?发行.*?不超过.*?(\d+(?:\.\d+)?)\s*亿',
             clean_text
         )
         if match and 0 < float(match.group(1)) <= 50:
@@ -343,6 +338,62 @@ class BondTermsExtractor(BaseExtractor):
             return f"{match.group(1)}亿元", ""
 
         return "", ""
+
+    def _extract_register_from_context(self, clean_text: str):
+        """通过"无异议函/上证函/深证函/注册"上下文定位注册金额和函号"""
+        # 无异议函上下文锚点（按优先级）
+        anchors = ["无异议函", "无异议的函", "上证函", "深证函", "注册总额", "注册金额", "注册规模"]
+        for anchor in anchors:
+            idx = -1
+            while True:
+                idx = clean_text.find(anchor, idx + 1)
+                if idx < 0:
+                    break
+                # 跳过目录（TOC）条目：锚点后跟大量点号
+                after = clean_text[idx + len(anchor):idx + len(anchor) + 60]
+                if after.count('.') > 15:
+                    continue
+                # 上下文窗口：锚点前 60 字 + 锚点后 1000 字（前 60 字用于识别"深交所"等表述）
+                window = clean_text[max(0, idx - 60):idx + 1000]
+                amount = self._find_register_amount_in_window(window)
+                if not amount:
+                    continue
+                letter = self._extract_approval_letter(window)
+                return amount, letter
+        return None
+
+    def _find_register_amount_in_window(self, window: str) -> str:
+        """在无异议函上下文窗口中提取注册金额"""
+        patterns = [
+            # 注册总额/注册金额/注册规模/面值/发行总额/发行额度 ... 不超过 ... X 亿元
+            r'(?:注册总额|注册金额|注册规模|注册额度|发行总额|发行规模|发行额度|发行金额|面值|拟发行)\s*[^。]{0,40}?不超过[^。]{0,15}?(?:人民币)?[元]?\s*(\d+(?:\.\d+)?)\s*亿',
+            # 兜底：不超过 ... X 亿元（限制在窗口内，业务规则：不超过50亿）
+            r'不超过[^。]{0,15}?(?:人民币)?[元]?\s*(\d+(?:\.\d+)?)\s*亿',
+        ]
+        for pat in patterns:
+            m = re.search(pat, window)
+            if m and 0 < float(m.group(1)) <= 50:
+                return f"{m.group(1)}亿元"
+        return ""
+
+    def _extract_approval_letter(self, text: str) -> str:
+        """在文本中提取无异议函函号（仅匹配上证函/深证函，避免误匹配"保证函"）"""
+        # 优先匹配 上证函/深证函 + 号（含 OCR 误识别"上正函"，"正"为"证"的误识别）
+        m = re.search(r'[上深][证正]函[^号]{0,50}?号', text)
+        if m:
+            letter = m.group(0)
+            # 排除占位符/未披露函号（如"上证函【】号""深证函〔20XX〕【】号"）
+            if '【】' in letter or '20XX' in letter or '〔〕' in letter:
+                letter = ''
+            else:
+                # 归一化 OCR 误识别："上正函"→"上证函"
+                letter = letter.replace('上正函', '上证函').replace('深正函', '深证函')
+                return letter
+        # 其次匹配证券交易所名称（无函号的情形，如"深圳证券交易所同意挂牌转让无异议的函"）
+        for exchange in ['上海证券交易所', '深圳证券交易所']:
+            if exchange in text:
+                return f"{exchange}无异议函"
+        return ""
 
     def _extract_sections_text(self) -> str:
         """提取发行条款和募集资金运用章节的文本"""

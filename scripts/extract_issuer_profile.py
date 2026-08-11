@@ -761,8 +761,9 @@ class IssuerProfileExtractor(BaseExtractor):
             name = re.sub(r'\s*报告期内.*$', '', name)
             name = re.sub(r'\s*（三）.*$', '', name)
             name = re.sub(r'\s*截至.*$', '', name)
-            # 移除"控股股东为"前缀（pattern 10 捕获）
+            # 移除"控股股东为"/"控股股东"前缀（pattern 捕获）
             name = re.sub(r'^控股股东为\s*', '', name)
+            name = re.sub(r'^控股股东\s*', '', name)
             name = re.sub(r'^的为.*$', '', name)
             # 移除紧跟在公司名后的"（三）"等章节标记（无空格）
             name = re.sub(r'[（(]三[）)].*$', '', name)
@@ -867,6 +868,11 @@ class IssuerProfileExtractor(BaseExtractor):
 
                     # 清理公司名称
                     company = clean_company_name(company)
+
+                    # 过滤片段式错误匹配（如"办公室）持有..."被清理为"办公室）"）
+                    # 特征：包含未配对的右括号
+                    if ('）' in company and '（' not in company) or (')' in company and '(' not in company):
+                        continue
 
                     # 验证并过滤无效名称
                     if is_valid_company_name(company):
