@@ -1403,7 +1403,7 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
                         # 安全校验：排除现金流量预测表等（凤城场景）
                         header_for_check = ' '.join([' '.join(row) for row in table[:4]]).lower()
                         all_for_check = ' '.join([' '.join(row) for row in table]).lower()
-                        has_future_years = bool(re.search(r'202[6789]|203\d', header_for_check))
+                        has_future_years = self._is_prediction_table(header_for_check, all_for_check)
                         has_cashflow_proj = any(kw in all_for_check for kw in [
                             '现金流量', '筹资活动', '投资活动', '经营活动产生的',
                             '现金小计', '现金流入', '现金流出', '资金筹措',
@@ -1446,22 +1446,35 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
                                         break
                                 # 只有当表格有大数值特征时才归为 cost
                                 if table_has_large:
-                                    # 共享业务名称 → 这是成本/毛利润表
-                                    result['cost'] = self._format_table_to_markdown_v3(table)
-                                    print(f"  识别到 cost 表格 (同页双表收入+成本, 第{page_num + 1}页)")
-                                    continue
+                                    # 排除第二个表格本身仍是收入表的情况（如募集说明书
+                                    # 后文重复出现的营业收入表）。成本表表头应含"成本"，
+                                    # 纯收入表头（收入+占比、无成本/毛利润/毛利率）不应归为 cost
+                                    #（龙游县场景：第118页重复的营业收入表被误判为成本）。
+                                    _hdr2 = ' '.join([' '.join(row) for row in table[:4]]).lower()
+                                    _is_rev_like = ('收入' in _hdr2 and '成本' not in _hdr2 and
+                                                    '毛利润' not in _hdr2 and '毛利率' not in _hdr2)
+                                    if not _is_rev_like:
+                                        # 共享业务名称 → 这是成本/毛利润表
+                                        result['cost'] = self._format_table_to_markdown_v3(table)
+                                        print(f"  识别到 cost 表格 (同页双表收入+成本, 第{page_num + 1}页)")
+                                        continue
                     elif forced == 'cost' and not result.get('cost'):
                         # 安全校验：即使位置推断为 cost，也要排除未来年份预测表和
                         # 现金流量预测表（凤城场景：page 188 现金流量表被误判为成本）
                         header_for_check = ' '.join([' '.join(row) for row in table[:4]]).lower()
                         all_for_check = ' '.join([' '.join(row) for row in table]).lower()
-                        has_future_years = bool(re.search(r'202[6789]|203\d', header_for_check))
+                        has_future_years = self._is_prediction_table(header_for_check, all_for_check)
                         has_cashflow_proj = any(kw in all_for_check for kw in [
                             '现金流量', '筹资活动', '投资活动', '经营活动产生的',
                             '现金小计', '现金流入', '现金流出', '资金筹措',
                             '债券本息', '收回投资', '分配股利', '偿付利息'
                         ])
-                        if not has_future_years and not has_cashflow_proj:
+                        # 排除表头为毛利率/毛利润组合表的情况：位置推断可能因页面
+                        # 含"营业成本"上下文而将毛利润+毛利率组合表误判为成本表
+                        #（龙游县场景：第118页组合表被误判为成本）。
+                        is_margin_type = ('毛利率' in header_for_check or '毛利润' in header_for_check) and \
+                                         '成本' not in header_for_check
+                        if not has_future_years and not has_cashflow_proj and not is_margin_type:
                             result['cost'] = self._format_table_to_markdown_v3(table)
                             print(f"  识别到 cost 表格 (位置推断, 第{page_num + 1}页)")
                             continue
@@ -1679,8 +1692,8 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
                     all_text_scan = ' '.join([' '.join(row) for row in table]).lower()
                     data_rows_scan = table[2:] if len(table) > 2 else []
 
-                    # 排除明显不相关的表格
-                    if re.search(r'202[6789]|203\d', header_text_scan):
+                    # 排除明显不相关的表格（未来年份预测表）
+                    if self._is_prediction_table(header_text_scan, all_text_scan):
                         continue
                     if any(kw in all_text_scan for kw in ['现金流量', '筹资活动', '投资活动', '资产负债', '货币资金', '应收账款', '净利润', '借款', '子公司', '关联方', '政府补助']):
                         continue
@@ -1835,6 +1848,67 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
 
         return result
 
+    def _get_bond_year(self) -> int:
+        """
+        获取债券发行年份，用于判断表头中的哪些年份属于"未来预测年份"。
+
+        债券募集说明书的报告期一般为发行年份的前两年及一期：
+        - 2025 年发行的债券报告 2023/2024/2025（一期），此时 2026+ 属于预测年份；
+        - 2026 年发行的债券报告 2024/2025/2026（一期），此时 2026 是真实报告期，
+          只有 2027+ 才属于预测年份。
+        故"未来年份"不能硬编码为 2026+，需依据债券发行年份动态判断。
+        """
+        # 优先从已解析的债券信息获取发行年份
+        try:
+            if self._bond_info and self._bond_info.year:
+                m = re.search(r'(20\d{2})', self._bond_info.year)
+                if m:
+                    return int(m.group(1))
+        except Exception:
+            pass
+        # 兜底：从文件名解析
+        m = re.search(r'(20\d{2})\s*年', self.pdf_name)
+        if m:
+            return int(m.group(1))
+        # 最终兜底：使用当前年份
+        return datetime.now().year
+
+    def _has_future_year(self, header_text: str) -> bool:
+        """
+        判断表头是否包含未来预测年份（严格大于债券发行年份）。
+
+        例如债券发行于 2026 年时，表头中的 "2026 年1-3 月" 是真实报告期，
+        不视为预测年份；"2027 年"、"2028 年" 等才视为预测年份。
+        """
+        bond_year = self._get_bond_year()
+        years = re.findall(r'20\d{2}', header_text)
+        return any(int(y) > bond_year for y in years)
+
+    def _is_prediction_table(self, header_text: str, all_text: str) -> bool:
+        """
+        判断表格是否为未来年份预测表（如现金流量预测表、偿债计划表等）。
+
+        仅当表头包含大于债券发行年份的年份，且不具备分板块收入/成本/毛利率表
+        结构时才视为预测表。若表头同时含业务板块/项目列与金额/占比/收入/成本/
+        毛利润/毛利率等财务列，则属于真实的分板块财务表（即使含当年年份，
+        如 "2026 年1-3 月"），不应被当作预测表排除（平潭场景：营业成本表被误排除）。
+        """
+        if not self._has_future_year(header_text):
+            return False
+        has_business_col = any(kw in header_text for kw in [
+            '业务板块', '业务板块名称', '业务名称', '业务类型', '业务种类', '分板块', '板块'
+        ])
+        has_finance_col = any(kw in header_text for kw in [
+            '金额', '占比', '收入', '成本', '毛利润', '毛利率', '利润'
+        ])
+        if has_business_col and has_finance_col:
+            return False
+        # 若表格数据行本身包含业务板块名称与财务数值，也视为真实财务表
+        if '业务板块' in all_text or '业务名称' in all_text or '分板块' in all_text:
+            if re.search(r'金额|占比|毛利率|毛利润|营业成本|营业收入', all_text):
+                return False
+        return True
+
     def _identify_table_type_v3(self, table: List[List[str]], section_info: Dict, result: Dict[str, str], page_text: str = "", force_cost: bool = False) -> Optional[str]:
         """
         识别表格类型 v4.0 - 增强排除规则，避免误识别
@@ -1861,12 +1935,12 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
 
         # ===== 第一步：排除明确不相关的表格 =====
 
-        # 排除1：未来年份预测表（包含2026+年份）
-        # 如果表头同时包含未来年份和报告期年份，也排除（这是预测表）
-        has_future_years = re.search(r'202[6789]|203\d', header_text) is not None
-        has_reporting_years = re.search(r'202[2345]', header_text) is not None
-        if has_future_years:
-            return None  # 任何包含2026+年份的表头都是预测表，排除
+        # 排除1：未来年份预测表
+        # 不能硬编码 2026+ 为未来年份：2026 年发行的债券报告期为 2024/2025/2026（一期），
+        # "2026 年1-3 月" 是真实报告期（平潭场景：营业成本表被误排除）。
+        # 只有具备未来年份且不具备分板块财务表结构的表格才视为预测表。
+        if self._is_prediction_table(header_text, all_text):
+            return None  # 预测表排除
 
         # 排除2：现金流量表
         has_cashflow = any(kw in all_text for kw in ['现金流量', '筹资活动', '投资活动', '经营活动产生的现金流量'])
@@ -1879,11 +1953,14 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
             return None
 
         # 排除4：资产负债表项目
+        # 注：'流动资产'/'非流动资产'/'资产总计'/'负债合计' 是资产负债表行项目，
+        # 不会出现在分板块收入/成本/毛利率表中（龙游县场景：简化资产负债表被误判为成本）。
         has_balance_sheet = any(kw in all_text for kw in [
             '总资产', '总负债', '所有者权益', '资产负债率',
             '货币资金', '应收账款', '交易性金融资产', '存货', '固定资产',
             '流动负债', '非流动负债', '短期借款', '长期借款',
-            '应付账款', '预收账款', '其他应收款'
+            '应付账款', '预收账款', '其他应收款',
+            '流动资产', '非流动资产', '资产总计', '负债合计'
         ])
         if has_balance_sheet:
             return None
@@ -2150,7 +2227,12 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
         # 同时检查页面上下文（关键词可能在表格上方但不在表格内）
         page_lower = page_text.lower() if page_text else ''
         has_margin_in_page = '毛利率' in page_lower or '毛利润' in page_lower
-        has_cost_in_page = '营业成本' in page_lower
+        # 营业成本上下文：页面文本含"营业成本"，或页面经章节分析判定为纯营业成本章节
+        # （has_cost 且非 has_revenue）。修复：广州开投场景——成本表标题为
+        # "主营业务成本构成"，页面文本不含"营业成本"，导致第54页成本表被误判为营业收入。
+        # 注意：不能放宽文本匹配（"成本构成"会误伤营业收入页的"主营业务收入及成本构成"标题）。
+        has_cost_in_page = ('营业成本' in page_lower) or \
+                           (section_info.get('has_cost', False) and not section_info.get('has_revenue', False))
         has_revenue_in_page = '营业收入' in page_lower
 
         # 表头关键词
@@ -2179,8 +2261,11 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
 
         # 优先检测：毛利润金额表（大数值特征）- 应归为 cost 而非 margin
         # 注意：只在页面没有"营业收入"相关上下文中才检查，避免将收入表误判
+        # 注意：仅针对纯毛利润金额表（表头无"毛利率"列）。若表头同时含"毛利率"列
+        # （如"毛利润 | 毛利润占比 | 毛利率"组合表），属于毛利率/毛利润综合表，
+        # 不应归为 cost（龙游县场景：组合表被误判为营业成本）。
         has_revenue_context = has_revenue_in_page or '营业收入' in page_text.lower()
-        if ('毛利润' in all_text) and not has_revenue and not has_cost and not has_revenue_context:
+        if ('毛利润' in all_text) and '毛利率' not in header_text and not has_revenue and not has_cost and not has_revenue_context:
             if self._is_gross_profit_amount_table(table):
                 return "cost" if not result.get('cost') else None
 
