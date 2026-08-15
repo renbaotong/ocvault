@@ -46,6 +46,7 @@ ocvault/
 | `extract_financial_analysis.py` | 05-资产结构分析 | 资产构成（流动资产/非流动资产/资产总计） |
 | `run_all.py` | — | 批量运行以上 5 个脚本 + 生成索引；>3 份募集说明书时自动并行（≤3 并发），`--no-parallel` 强制串行 |
 | `generate_meta_index.py` | 00-Meta/ | 生成发行人索引和债券索引笔记 |
+| `verify_all.py` | — | 全量验证：用 raw/ 下每个 PDF 重新提取并与 knowledge/ 逐篇对比（忽略日期字段），确认脚本输出与知识库一致 |
 
 ## 使用方法
 
