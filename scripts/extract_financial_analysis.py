@@ -499,6 +499,10 @@ class FinancialAnalysisExtractor(BaseExtractor):
                 all_numbers = self._extract_numbers_for_item(merged_lines, i, item_name, required_numbers)
                 if len(all_numbers) >= num_years:
                     values = self._parse_values(all_numbers, num_years)
+                    # 全为占位符（-）的行表示源表该行无数据，跳过（保持与原行为一致，不新增空行）
+                    if all(v["amount"] == "-" and v["ratio"] == "-" for v in values):
+                        i += 1
+                        continue
                     if len(values) >= num_years:
                         self._add_asset_item(result, item_name, values, current_section)
                     i = i + 1 + min(len(all_numbers), 15)
@@ -625,13 +629,18 @@ class FinancialAnalysisExtractor(BaseExtractor):
             if is_new_item:
                 break
 
+            # 占位符单元格（如 '-'、'--'、'——'）保留位置，避免（金额,占比）交替配对错位，
+            # 否则占比缺失的行会把后续金额误配为占比（如无形资产行，task 51）
+            if re.fullmatch(r'[-—–]{1,8}', num_line):
+                consecutive_numbers.append('-')
+                continue
+
             nums = re.findall(r'[\d,]+\.?\d*', num_line_clean)
             if nums:
                 for num in nums:
                     clean_num = num.replace(',', '')
                     if clean_num:
                         consecutive_numbers.append(clean_num)
-
         if len(consecutive_numbers) >= required_numbers:
             return consecutive_numbers[:required_numbers]
 
@@ -755,7 +764,7 @@ class FinancialAnalysisExtractor(BaseExtractor):
             if i + 1 < len(all_numbers):
                 values.append({"amount": all_numbers[i], "ratio": all_numbers[i + 1]})
             else:
-                values.append({"amount": all_numbers[i], "ratio": "0"})
+                values.append({"amount": all_numbers[i], "ratio": "-"})
         return values[:num_years]
 
     def _extract_from_balance_sheet(self, result: Dict) -> Dict:
@@ -884,8 +893,11 @@ class FinancialAnalysisExtractor(BaseExtractor):
                 continue
             values = item.get("values", [])
             if values:
-                # 取最新一期的占比
+                # 取最新一期的占比；金额缺失（-）时占比无意义，跳过
+                latest_amount = values[0].get("amount", "-")
                 latest_ratio = values[0].get("ratio", "0")
+                if str(latest_amount) in ("-", ""):
+                    continue
                 try:
                     ratio = float(str(latest_ratio).replace("%", ""))
                     if ratio > threshold:
@@ -895,8 +907,115 @@ class FinancialAnalysisExtractor(BaseExtractor):
 
         return high_items
 
+    def _repair_misaligned_items(self, data: Dict) -> Dict:
+        """
+        task 51: 用 pdfplumber 结构化表格修复文本解析导致的（金额,占比）错位行。
+        仅当行内出现错位特征（金额为占位符、或占比数值>100%）时触发修复，
+        不影响解析正常的行，也不新增/删除行。
+        """
+        def _is_misaligned(values) -> bool:
+            for v in values:
+                if v.get("amount", "") in ("-", ""):
+                    return True
+                r = v.get("ratio", "")
+                if r not in ("-", ""):
+                    try:
+                        if float(r) > 100:
+                            return True
+                    except ValueError:
+                        return True
+            return False
+
+        all_items = data.get("flow_assets", []) + data.get("non_flow_assets", [])
+        targets = [it for it in all_items if _is_misaligned(it.get("values", []))]
+        if not targets:
+            return data
+        # 期数：2 期（如 2025/2024）或 3 期（2025/2024/2023），按现有值推断
+        num_years = len(targets[0].get("values", []))
+        if num_years < 2:
+            num_years = len(data.get("years", [])) or 2
+        required_cells = num_years * 2
+
+        try:
+            import pdfplumber
+        except ImportError:
+            return data
+
+        # 收集包含资产结构表（或相关明细表）的页面：放宽到含"占比"+"金额/账面价值/万元"的页，
+        # 避免漏掉如"在建工程构成表"（表头用"账面价值"）所在页（task 51）
+        asset_pages = []
+        for pno, page in enumerate(self.doc):
+            if pno < 30:
+                continue
+            text = page.get_text()
+            if ('占比' in text and ('金额' in text or '账面价值' in text or '万元' in text)
+                    and any(kw in text for kw in ["货币资金", "固定资产", "无形资产", "长期股权投资", "在建工程"])):
+                asset_pages.append(pno)
+        asset_pages = asset_pages[:20]  # 限制扫描页数，防止极端情况过慢
+
+        names = {it["name"] for it in targets}
+        with pdfplumber.open(self.pdf_path) as pdf:
+            for pno in asset_pages:
+                if not names:
+                    break
+                for table in pdf.pages[pno].extract_tables():
+                    if not names:
+                        break
+                    for row in table:
+                        if not row or not row[0]:
+                            continue
+                        name = str(row[0]).replace("\n", "").strip()
+                        if name not in names:
+                            continue
+                        cells = []
+                        for c in row[1:1 + required_cells]:
+                            s = str(c).replace("\n", "").strip() if c is not None else ""
+                            s = s.replace(",", "")
+                            cells.append(s if s else "-")
+                        if len(cells) < required_cells:
+                            continue
+                        values = []
+                        for k in range(0, required_cells, 2):
+                            values.append({"amount": cells[k], "ratio": cells[k + 1]})
+                        for it in all_items:
+                            if it["name"] == name:
+                                it["values"] = values
+                                names.discard(name)
+                                print(f"  [pdfplumber修复] {name}: {values}")
+                                break
+
+        # 修复后仍错位的行：仅当最新一期错位、或存在 >100% 的垃圾占比时才丢弃，
+        # 避免误删最新期数据正确的重要资产行（如投资性房地产>20%）
+        def _unusable(values) -> bool:
+            if not values:
+                return True
+            first = values[0]
+            if first.get("amount", "") in ("-", ""):
+                return True
+            for v in values:
+                r = v.get("ratio", "")
+                if r not in ("-", ""):
+                    try:
+                        if float(str(r).replace("%", "")) > 100:
+                            return True
+                    except ValueError:
+                        return True
+            return False
+
+        remaining = [n for n in names if any(
+            it["name"] == n and _unusable(it.get("values", []))
+            for it in all_items)]
+        if remaining:
+            for grp_name in ("flow_assets", "non_flow_assets"):
+                data[grp_name] = [it for it in data.get(grp_name, [])
+                                  if it["name"] not in remaining]
+            print(f"  [pdfplumber修复] 无法修复已丢弃: {sorted(remaining)}")
+        return data
+
     def extract_financial_data(self) -> Dict:
         data = self._extract_table_from_pages()
+        # task 51: 修复文本解析导致的（金额,占比）错位行
+        data = self._repair_misaligned_items(data)
         # 找出占比>20%的单项资产
         high_ratio_items = self._find_high_ratio_items(data, threshold=20.0)
         if high_ratio_items:
@@ -1160,7 +1279,8 @@ class FinancialAnalysisExtractor(BaseExtractor):
                 amount = v.get("amount", "-")
                 ratio = v.get("ratio", "-")
                 year_label = years[i] if i < len(years) else f"第{i+1}期"
-                period_descs.append(f"{year_label}金额为{amount}万元，占比{ratio}%")
+                ratio_text = "-" if ratio in ("-", "") else f"{str(ratio).rstrip('%')}%"
+                period_descs.append(f"{year_label}金额为{amount}万元，占比{ratio_text}")
 
             section += "；".join(period_descs) + "。"
 
@@ -1172,6 +1292,13 @@ class FinancialAnalysisExtractor(BaseExtractor):
             section += "\n\n"
 
         return section
+
+    def _ratio_str(self, v) -> str:
+        """格式化占比：占位符 '-' 不带百分号；源值可能已含 '%'，去重后统一加（task 51）"""
+        ratio = v.get("ratio", "-")
+        if ratio in ("-", ""):
+            return ratio
+        return ratio.rstrip('%') + '%'
 
     def _build_asset_table(self, data: Dict) -> str:
         years = data.get("years", [])
@@ -1200,7 +1327,7 @@ class FinancialAnalysisExtractor(BaseExtractor):
         for item in data.get("flow_assets", []):
             row = f"| {item['name']}"
             for v in item['values'][:num_periods]:
-                row += f" | {v['amount']} | {v['ratio']}%"
+                row += f" | {v['amount']} | {self._ratio_str(v)}"
             row += " |"
             rows.append(row)
 
@@ -1208,7 +1335,7 @@ class FinancialAnalysisExtractor(BaseExtractor):
         if flow_total:
             row = "| **流动资产合计**"
             for v in flow_total[:num_periods]:
-                row += f" | **{v['amount']}** | **{v['ratio']}%**"
+                row += f" | **{v['amount']}** | **{self._ratio_str(v)}**"
             row += " |"
             rows.append(row)
 
@@ -1216,7 +1343,7 @@ class FinancialAnalysisExtractor(BaseExtractor):
         for item in data.get("non_flow_assets", []):
             row = f"| {item['name']}"
             for v in item['values'][:num_periods]:
-                row += f" | {v['amount']} | {v['ratio']}%"
+                row += f" | {v['amount']} | {self._ratio_str(v)}"
             row += " |"
             rows.append(row)
 
@@ -1224,7 +1351,7 @@ class FinancialAnalysisExtractor(BaseExtractor):
         if non_flow_total:
             row = "| **非流动资产合计**"
             for v in non_flow_total[:num_periods]:
-                row += f" | **{v['amount']}** | **{v['ratio']}%**"
+                row += f" | **{v['amount']}** | **{self._ratio_str(v)}**"
             row += " |"
             rows.append(row)
 
@@ -1232,7 +1359,7 @@ class FinancialAnalysisExtractor(BaseExtractor):
         if total:
             row = "| **资产总计**"
             for v in total[:num_periods]:
-                row += f" | **{v['amount']}** | **{v['ratio']}%**"
+                row += f" | **{v['amount']}** | **{self._ratio_str(v)}**"
             row += " |"
             rows.append(row)
 

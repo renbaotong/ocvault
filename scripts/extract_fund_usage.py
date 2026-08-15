@@ -571,6 +571,11 @@ class FundUsageExtractor(BaseExtractor):
 
     def _clean_usage_name(self, name: str) -> str:
         name = name.strip().rstrip('。,.，')
+        # 切断"、"后紧跟金额子句的情况（如"偿还有息债务、1.00 亿元用于补充流动资金"），
+        # 否则后续金额子句会被吞进用途名，导致使用计划/明细表拼接重复（task 51）
+        m = re.search(r'、\s*\d[\d,]*\.?\d*\s*[亿万]', name)
+        if m:
+            name = name[:m.start()].strip().rstrip('。,.，')
         invalid_keywords = ['偿债保障', '可变现', '不足', '不可', '不得', '无法', '不能', '风险', '提示']
         if any(kw in name for kw in invalid_keywords):
             return ""
