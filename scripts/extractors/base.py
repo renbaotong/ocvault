@@ -393,18 +393,33 @@ class BaseExtractor:
         os.makedirs(path, exist_ok=True)
         return path
 
+    # 笔记中随运行日期变化的字段行（frontmatter created / 正文提取日期），
+    # 内容对比时忽略，避免 run_all.py 重跑产生纯日期噪音
+    _DATE_LINE_RE = re.compile(r'^(created:.*|.*提取日期.*)$', re.M)
+
     def write_note(self, path: str, content: str) -> bool:
         """
         写入笔记文件
+
+        仅当内容真实变化时才写入（用户要求）：
+        - 对比时忽略 created/提取日期 字段与行尾差异
+        - 内容未变 → 跳过写入，保留原文件（原日期与行尾不变，避免 git 噪音）
+        - 内容变化 → 正常写入（日期更新为当天，符合实际重新提取的事实）
 
         Args:
             path: 文件路径
             content: 文件内容
 
         Returns:
-            是否写入成功
+            是否成功（跳过写入也视为成功）
         """
         try:
+            if os.path.exists(path):
+                with open(path, 'rb') as f:
+                    existing = f.read()
+                if self._notes_content_equal(existing, content):
+                    self._logger.info(f"内容无变化，跳过：{path}")
+                    return True
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, 'w', encoding='utf-8') as f:
                 f.write(content)
@@ -413,6 +428,13 @@ class BaseExtractor:
         except Exception as e:
             self._logger.error(f"写入失败：{e}")
             return False
+
+    def _notes_content_equal(self, existing: bytes, new_content: str) -> bool:
+        """判断笔记新旧内容是否等价：忽略 created/提取日期 字段与行尾差异"""
+        def _norm(b: bytes) -> str:
+            text = b.decode('utf-8', errors='replace').replace('\r\n', '\n')
+            return self._DATE_LINE_RE.sub('', text)
+        return _norm(existing) == _norm(new_content.encode('utf-8'))
 
     def get_frontmatter(self, note_type: str, tags: List[str], extra_fields: Optional[Dict[str, Any]] = None) -> str:
         """
