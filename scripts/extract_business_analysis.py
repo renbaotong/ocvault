@@ -95,7 +95,8 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
                     tabs = page.find_tables()
                     for tab in tabs.tables:
                         data = tab.extract()
-                        if data and len(data) >= 2:
+                        # 保留普通多行表格，以及跨页延续的合计行（单行表格）
+                        if data and (len(data) >= 2 or self._is_total_continuation_row(data)):
                             pymupdf_tables.append(data)
                 except:
                     pass
@@ -109,7 +110,7 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
                                 pp_page = pdf.pages[page_num]
                                 pp_tables = pp_page.extract_tables()
                                 for t in pp_tables:
-                                    if t and len(t) >= 2:
+                                    if t and (len(t) >= 2 or self._is_total_continuation_row(t)):
                                         pymupdf_tables.append(t)
                     except:
                         pass
@@ -118,10 +119,10 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
                     # 分析页面文本，找出章节类型
                     section_info = self._analyze_page_section_v3(page_text)
                     for idx, table in enumerate(pymupdf_tables):
-                        if table and len(table) >= 2:
+                        if table and (len(table) >= 2 or self._is_total_continuation_row(table)):
                             # 清理表格数据
                             cleaned_table = self._clean_table_data(table)
-                            if cleaned_table and len(cleaned_table) >= 2:
+                            if cleaned_table and (len(cleaned_table) >= 2 or self._is_total_continuation_row(cleaned_table)):
                                 page_data.append((page_num, idx, cleaned_table, page_text, section_info))
 
             doc.close()
@@ -782,6 +783,21 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
         识别表格类型并分配到相应类别 v4.0
         新增：跨页表格合并 + 大表格拆分
         """
+        if not page_data:
+            return result
+
+        # 预过滤：排除"纯投资收益/股权投资类收入披露表"
+        # （如青岛即墨科投的"股权投资类收入构成情况"表）。这类表是投资收益
+        # 拆解（表头"产生投资收益的来源"，行项目全部为投资收益类），
+        # 绝不是营业收入/营业成本/毛利率表，若不排除会被误识别为营业收入。
+        filtered_page_data = [
+            item for item in page_data
+            if not self._is_pure_investment_income_table(item[2])
+        ]
+        if len(filtered_page_data) != len(page_data):
+            removed = len(page_data) - len(filtered_page_data)
+            print(f"  排除 {removed} 个纯投资收益/股权投资类收入表")
+        page_data = filtered_page_data
         if not page_data:
             return result
 
@@ -2115,7 +2131,12 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
             return None
 
         # 排除22：单位成本分析表（元/吨、百分比构成等明细拆解）
-        has_unit_cost = ('元/吨' in all_text or '其中：' in all_text) and \
+        # 注意：必须同时出现"单位标记（元/吨 等）"和"其中："，仅凭"其中："
+        # 不足以判定——分板块营业收入/成本表常含"其中：xxx"子板块行
+        # （如内江兴宜的"其中：园区物业租赁"），若单独用"其中："会把
+        # 真实的营业收入/营业成本表误排除。
+        has_unit_cost = ('元/吨' in all_text or '元/m³' in all_text or '元/立方米' in all_text) and \
+                        '其中：' in all_text and \
                         not re.search(r'业务板块|业务名称|营业收入|营业成本|毛利润|毛利率|项目.*202', all_text)
         if has_unit_cost:
             return None
@@ -2942,6 +2963,69 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
             padded = list(row) + [""] * (max_cols - len(row))
             result.append([padded[c] for c in keep])
         return result
+
+    def _is_pure_investment_income_table(self, table: List[List[str]]) -> bool:
+        """
+        判断是否为"纯投资收益/股权投资类收入披露表"。
+
+        适用场景（如青岛即墨科投）：募集说明书在"营业收入构成情况"表之前
+        单独披露一张"股权投资类收入构成情况"表（表头为"产生投资收益的来源"，
+        行项目全部为 处置长期股权投资产生的投资收益 / 权益法核算的长期股权
+        投资收益 / 股权投资类收入）。这类表是投资收益（非营业收入）的拆解，
+        绝不应被识别为营业收入/营业成本/毛利率表。
+
+        判定规则：跳过表头行后，第一列的数据单元格绝大多数（>=75% 且 >=2 个）
+        都含"投资收益/股权投资/股权转让"等关键词，则该表为纯投资收益表。
+
+        注意：与 _filter_investment_income_rows 的区别——深圳福田等发行人的
+        "投资收益 + 营业收入"合并表（投资收益段只是前缀）不满足"绝大多数
+        单元格都是投资收益类"的条件，不会被本方法排除，仍由
+        _filter_investment_income_rows 处理。
+        """
+        if not table or len(table) < 2:
+            return False
+        invest_keywords = ['投资收益', '股权投资', '股权转让收益', '处置长期股权投资', '股权投资基金']
+        data_cells = []
+        for row in table[1:]:
+            if row and row[0] and row[0].strip():
+                cell = row[0].strip()
+                # 排除表头/标题行（如"业务板块"、"项目"）与合计行单独计数
+                if cell in ('项目', '业务板块', '业务板块名称', '业务名称', '序号'):
+                    continue
+                data_cells.append(cell)
+        if not data_cells:
+            return False
+        matched = sum(1 for c in data_cells if any(kw in c for kw in invest_keywords))
+        return matched >= 2 and matched >= len(data_cells) * 0.75
+
+    def _is_total_continuation_row(self, table: List[List[str]]) -> bool:
+        """
+        判断是否为跨页延续的"营业收入合计"行（单行表格）。
+
+        适用场景（如青岛即墨科投）：营业收入表的"营业收入合计"行单独落在
+        下一页，被 PyMuPDF 识别为 1 行 1 列的独立表格。若不保留该行，
+        上一页的营业收入表会与下一页的营业成本表错误合并（表头结构相同、
+        业务名称重叠导致跨页合并误判）。保留后，合计行作为上一页表格的
+        延续被合并回去，同时"合计"终结行会阻止与后续成本表继续合并。
+
+        注意：只保留"营业收入合计"类（第一单元格含"收入"）的合计行。
+        其他合计行（如营业成本合计、单独一个"合计"）保持原有丢弃行为，
+        以免改变其他发行人既有的跨页合并结果（如济宁城发：营业成本表的
+        合计行单独落页，若保留会拆散其原有的 成本表+毛利润表 合并）。
+
+        判定规则：单行表格，第一单元格含"收入"且含"合计/总计/小计"，
+        其余单元格至少有一个数值。
+        """
+        if not table or len(table) != 1 or not table[0]:
+            return False
+        row = table[0]
+        first = (row[0] or '').strip()
+        if '收入' not in first:
+            return False
+        if not any(kw in first for kw in ['合计', '总计', '小计']):
+            return False
+        numeric_count = sum(1 for c in row[1:] if c and re.search(r'\d', str(c)))
+        return numeric_count >= 1
 
     def _filter_investment_income_rows(self, table: List[List[str]]) -> List[List[str]]:
         """
