@@ -210,6 +210,44 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
                         if pages and page_num > max(pages):
                             break
 
+            # 修复（task 60）：主营业务章节标题下限过滤
+            # 现象：株洲高科等在"第四节 发行人基本情况"中先披露上市/重要子公司
+            #（如旷达科技）的分板块经营表，其表格页被宽松规则收集且页序靠前，
+            # 抢先占位 revenue/cost/margin；真正的主营业务表（紧随"主营业务情况"
+            # 章节标题后的营业收入构成表等）反而被跳过。
+            # 对策：定位正文真正的"X、发行人/公司主营业务情况"章节标题行（编号
+            # 开头、独立成行的短标题，排除目录点线行与正文长句误匹配），主营表格
+            # 几乎总出现在该标题之后，故以最早真标题页为下限，裁掉下限前混入的
+            # 子公司披露页。找不到编号标题行时不裁剪（兼容主营表靠宽松规则定位
+            # 的发行人，如福田资本：其营收表早于编号主营标题所在的章节）。
+            if pages:
+                true_title_pages = []
+                # 严格标题行：编号开头 + 主营业务情况（发行人/公司皆可）
+                title_pat = re.compile(
+                    r'^\s*[（(]?[〇零一二三四五六七八九十百\d]{1,3}[）)]?[、.．]'
+                    r'\s*(?:发行人|公司)\s*主营业务情况\s*$'
+                )
+                for sp_page, sp_name, sp_text in section_pages:
+                    if sp_name not in ('主营业务(二)', '七、主营业务', '主营业务', '收入成本毛利'):
+                        continue
+                    for line in sp_text.split('\n'):
+                        ls = line.strip()
+                        if not ls or len(ls) > 30:
+                            continue
+                        # 目录行：连续点线或尾部页码
+                        if re.search(r'[.…]{3,}', ls):
+                            continue
+                        if title_pat.match(ls):
+                            true_title_pages.append(sp_page)
+                            break
+                if true_title_pages:
+                    lower = min(true_title_pages) - 3
+                    kept = [p for p in pages if p >= max(0, lower)]
+                    dropped = [p for p in pages if p < max(0, lower)]
+                    if dropped:
+                        print(f"  主营标题下限: 第{min(true_title_pages) + 1}页, 排除下限前混入页 {[p + 1 for p in dropped]}")
+                    pages = kept
+
             doc.close()
 
             # 确保页面按顺序排列
@@ -3218,6 +3256,11 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
         过滤"收入/成本/毛利率"三列表中的毛利率表。
         当毛利率表包含"收入"或"成本"列时（表明来自三列表），
         仅保留包含"毛利率"的列。
+        注意（task 61）：判断"收入/成本"列时必须排除首列行名——
+        株洲高科等发行人的毛利率表首列为"收入分类"（行项目维度名，
+        如 投资类业务/汽车内饰/光伏发电），并非营业收入数据列。
+        若把"收入分类"误判为收入列，会把本来正确完整的毛利率表
+        （毛利润|占比|毛利率）错误地"过滤"成残缺表格。
         """
         if not margin_md:
             return margin_md
@@ -3228,8 +3271,19 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
 
         # 检查第一行（表头）是否包含"收入"或"成本"（表明是三列表）
         header_line = lines[0]
-        has_revenue_col = '收入' in header_line
-        has_cost_col = '成本' in header_line
+        # 找出首列（行名列）位置：跳过表头最前空的引导列
+        header_cells = header_line.split('|')
+        first_content_idx = -1
+        for ci, cell in enumerate(header_cells):
+            if cell.strip():
+                first_content_idx = ci
+                break
+        # 只检查"数据列"（首列之后）是否含"收入"/"成本"，
+        # 避免首列行名（如"收入分类"）被误判为收入数据列
+        data_cols = [c for ci, c in enumerate(header_cells)
+                     if ci != first_content_idx]
+        has_revenue_col = any('收入' in c for c in data_cols)
+        has_cost_col = any('成本' in c for c in data_cols)
         has_margin_col = '毛利率' in header_line or '毛利润' in header_line
 
         if not (has_revenue_col or has_cost_col) or not has_margin_col:
@@ -3288,7 +3342,11 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
                     result_parts.append(new_parts[ci])
                 else:
                     result_parts.append('')
-            new_lines.append('|'.join(result_parts))
+            # 修复（task 61）：重建行必须补全 markdown 格式——
+            # 用 "| 列 | 列 |" 的标准写法（含空格与行尾竖线），
+            # 不能直接 "|".join（会丢失行尾 | 与单元格间空格）。
+            row_cells = [str(c).strip() for c in result_parts]
+            new_lines.append('| ' + ' | '.join(row_cells) + ' |')
 
         # 确保分隔行有正确的列数
         result = '\n'.join(new_lines)
