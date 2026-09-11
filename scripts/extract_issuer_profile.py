@@ -1145,6 +1145,428 @@ class IssuerProfileExtractor(BaseExtractor):
         controlling_text = processed_text[controlling_start_idx:controlling_end_idx]
         return self._extract_equity_structure_from_controlling_shareholder(controlling_text)
 
+    # ===== task 64：完整股权结构提取（文字陈述 + 股东表 + 股权结构图） =====
+    # 机构名后缀（长的放前面，避免"公司"截断"有限公司"）
+    _EQ_SUFFIX = (
+        r'(?:国有资产监督管理委员会|国有资产监督管理办公室|国有资产监督管理局|'
+        r'政府国有资产监督管理委员会|新区管理委员会|高新技术产业开发区管理委员会|'
+        r'经济技术开发区管理委员会|管理委员会|监督管理委员会|'
+        r'国有资产运营服务中心|国有资产事务中心|国有资产管理服务中心|'
+        r'集团有限公司|股份有限公司|有限责任公司|有限公司|'
+        r'管委会|国资委|国资办|国资局|财政局|国资运营中心|人民政府|政府|委员会|'
+        r'街道办事处|办事处|集团|公司|中心|办公室|局)'
+    )
+
+    def _extract_equity_chain_complete(self, section_text: str) -> str:
+        """
+        完整股权结构提取（task 64）：综合三类信息重建完整股权链条
+          1) 文字陈述："X 持有发行人Y%的股权，为发行人控股股东"、"实际控制人为Z"
+          2) 股东表（股东名称 / 认缴出资额 / 持股比例）
+          3) 股权结构图（PDF 文本层中的图形文字，按阅读顺序取实体名与比例）
+        输出多层级"股权架构"代码块；提取失败返回"（待提取）"。
+        """
+        issuer = self._issuer_name or "发行人"
+        if not section_text or len(section_text.strip()) < 30:
+            return "（待提取）"
+
+        txt = re.sub(r'<[^>]+>', '\n', section_text)
+        try:
+            txt = self._merge_char_newlines(txt)
+        except Exception:
+            pass
+
+        # 合并被分栏/换行拆断的机构名（未闭合全角括号续行，
+        # 如"深圳市龙华区财政局（区国有资产"+"监督管理局、区集体资产管理局）"）
+        lines = []
+        buf = ""
+        skip_issuer_line = False
+        for raw in txt.split('\n'):
+            ls = raw.strip()
+            if not ls:
+                continue
+            # 过滤页眉页脚（"……公司债券（第一期）募集说明书"+单独页码），避免跨页处把
+            # 机构名切断（如"黄石市人民政府国有资产" + 页眉 + "监督管理委员会"）；
+            # 正文行（如"截至本募集说明书签署日，X公司"）不含"债券/第X期"，不会被丢弃
+            if '募集说明书' in ls and ('债券' in ls or re.search(r'第[一二三四五六七八九十\d]+期', ls)):
+                # 页眉块首行/次行常为发行人全称，一并丢弃
+                if lines and (lines[-1] == issuer
+                              or (issuer and len(lines[-1]) < 40 and issuer in lines[-1])):
+                    lines.pop()
+                skip_issuer_line = True
+                continue
+            if re.fullmatch(r'\d{1,4}', ls):
+                continue
+            if skip_issuer_line:
+                skip_issuer_line = False
+                if ls == issuer or (issuer and len(ls) < 40 and issuer in ls):
+                    continue
+            if buf:
+                ls = buf + ls
+                buf = ""
+            if ls.count('（') > ls.count('）'):
+                buf = ls
+                continue
+            lines.append(ls)
+        if buf:
+            lines.append(buf)
+
+        flat = re.sub(r'\s+', '', '\n'.join(lines))  # 无空白版本（名字跨行已合并）
+        SUF = self._EQ_SUFFIX
+        # 贪婪前缀：一次匹配整个机构名（含"淮北市人民政府国有资产监督管理委员会"这类叠加后缀）；
+        # 字符类含顿号、全角括号，并允许名称以"）"收尾（如"…财政局（区国资…局）"）
+        NAME = r'([\u4e00-\u9fa5（）()·、]{2,50}' + SUF + r'）?)'
+        name_re = re.compile(NAME)
+
+        JUNK_PREFIX = re.compile(
+            r'^.*(?:的控股股东|控股股东|实际控制人|的股东|股东|变更为|成为|出资人由|'
+            r'基本情况|情况如下|如下所示|截至|签署日|报告期末|报告期|股权结构图|股权结构|'
+            r'因此|同时|此外|另外|其中|因|故|而|则|其)'
+        )
+        # 前置括号块（如经营范围括号、授权说明括号）不是名称的一部分
+        LEAD_PAREN = re.compile(r'^[（(][^）)]{0,80}[）)]')
+
+        def clean_name(nm):
+            nm = (nm or '').strip()
+            # 去掉前文修饰语/章节标题残留，只保留机构名本身
+            nm = JUNK_PREFIX.sub('', nm)
+            nm = LEAD_PAREN.sub('', nm)
+            nm = re.sub(r'[（(][^）)]*以下简称[^）)]*[）)]', '', nm)
+            nm = re.sub(r'[（(][^）)]*简称[^）)]*[）)]', '', nm)
+            nm = re.sub(r'^(?:的|及|和|与|系|为|是|由)+', '', nm)
+            nm = nm.strip('，。；、： ')
+            # 正文中以"全称（以下简称"简称"）"定义过简称时，用全称替换简称
+            if nm and len(nm) <= 15 and len(nm) >= 4:
+                am = re.search(r'([\u4e00-\u9fa5（）()]{4,40}?)[（(]以下简称[“"]?'
+                               + re.escape(nm) + r'[”"]?[）)]', flat)
+                if am and valid_name(am.group(1)):
+                    nm = am.group(1)
+            return nm.strip('，。；、： ')
+
+        def norm_ratio(r):
+            """比例合法性校验：0<v<=100，否则视为无效（避免把年份/金额当比例）"""
+            if not r:
+                return None
+            s = str(r).strip().rstrip('%').replace(',', '')
+            try:
+                v = float(s)
+            except ValueError:
+                return None
+            if v <= 0 or v > 100:
+                return None
+            return s
+
+        def valid_name(nm):
+            if not nm or not (6 <= len(nm) <= 60):
+                return False
+            if re.fullmatch(SUF, nm):
+                return False  # 只有后缀（如"有限公司"）不是有效名称
+            # 名称必须以机构后缀结尾（可带收尾括号），避免句子碎片（如"…集团成立于"）
+            if not re.search(SUF + r'）?$', nm):
+                return False
+            if not re.search(r'[\u4e00-\u9fa5]{2,}', re.sub(SUF + r'）?$', '', nm)):
+                return False
+            if any(k in nm for k in ('依法须经批准', '营业执照', '经营范围', '经营项目',
+                                     '募集说明书', '债券', '非公开发行', '发行人', '本公司',
+                                     '公司债', '本次')):
+                return False
+            if re.search(r'\d', nm):
+                return False
+            if re.search(r'变更为|成为|持有|控股股东|实际控制|出资', nm):
+                return False
+            return True
+
+        def norm_key(nm):
+            k = re.sub(r'[（(].*?[）)]', '', nm or '')
+            k = re.sub(r'(?:集团)?有限公司$|有限责任公司$|股份有限公司$|有限公司$|集团$|公司$', '', k)
+            return k.strip()
+
+        def same_entity(a, b):
+            """机构同一性判断：去除组织形式后缀后比较。
+            允许"后缀包含"（如"费县国有资产管理服务中心"与"山东省临沂市费县
+            国有资产管理服务中心"为同一机构，前者是后者后缀），
+            但不能用"前缀包含"——否则发行人"XX市文化旅游股份有限公司"会被误判
+            为股东"XX市文化旅游投资集团有限公司"（task 64）。"""
+            ka, kb = norm_key(a), norm_key(b)
+            if not ka or not kb:
+                return False
+            if ka == kb:
+                return True
+            if len(ka) >= 6 and len(kb) >= 6:
+                if kb.endswith(ka) or ka.endswith(kb):
+                    return True
+            return False
+
+        def is_issuer(nm):
+            """是否为发行人自身（含名称被前缀污染的情况，如"深圳市深圳市福田…公司公司"）"""
+            if same_entity(nm, issuer):
+                return True
+            iss = issuer or ""
+            if len(iss) >= 6 and iss in (nm or ""):
+                return True
+            return False
+
+        holders = []  # [(name, ratio or None)] 直接股东（按出现顺序）
+        holder_pos = {}  # {name: 首次出现位置}，用于剔除报告期内历史股东
+
+        holder_trace = []
+
+        def push_holder(nm, ratio, src='', pos=-1):
+            raw = nm
+            nm = clean_name(nm)
+            ok = valid_name(nm)
+            if os.environ.get('EQ_DEBUG'):
+                holder_trace.append((src, raw, nm, ratio, ok))
+            if not ok:
+                return
+            if is_issuer(nm):
+                return  # 表格/图里的发行人自身不是持股股东
+            ratio = norm_ratio(ratio)
+            for i, (ex, r) in enumerate(holders):
+                if same_entity(nm, ex):
+                    if ratio and not r:
+                        holders[i] = (ex, ratio)
+                    return
+            if pos >= 0:
+                holder_pos[nm] = pos
+            holders.append((nm, ratio))
+
+        # ---------- 1) 文字陈述：持股比例 ----------
+        hold_pats = [
+            # X（以下简称"XX"）持有发行人/公司 Y% 的股权
+            # （中间允许"股权比例为/的股权为"等少量措辞；bridge 用于排除
+            #  "X持有Y公司100%股权"这类对上层母公司的持股陈述）
+            re.compile(NAME + r'\s*(?:（[^）]{0,30}）)?\s*(?:直接|合计|间接)?(?:持有|持股)\s*'
+                       r'([^。；，]{0,12}?)\s*([\d,]+(?:\.\d+)?)\s*%'),
+            # 控股股东（及实际控制人）为 X，持有发行人 Y%
+            re.compile(r'(?:发行人|公司)(?:的)?控股股东(?:(?:及|和)实际控制人)?\s*(?:为|是|系)\s*[^。；，]{0,15}?'
+                       + NAME + r'[^。；]{0,60}?([\d,]+(?:\.\d+)?)\s*%'),
+            # X 系/为/是 发行人控股股东，持有 Y%
+            re.compile(NAME + r'\s*(?:系|为|是)\s*(?:发行人|公司)(?:的)?控股股东[^。；]{0,60}?([\d,]+(?:\.\d+)?)\s*%'),
+        ]
+        # pattern 0 的捕获组为 (名称, 桥接文本, 比例)；其余为 (名称, 比例)
+        for pi, pat in enumerate(hold_pats):
+            for mm in pat.finditer(flat):
+                if pi == 0:
+                    nm_c, bridge, ratio_c = mm.group(1), mm.group(2), mm.group(3)
+                else:
+                    nm_c, bridge, ratio_c = mm.group(1), '', mm.group(2)
+                seg = mm.group(0)
+                # "间接持有公司X%，为公司实际控制人"属于控制人层级（task 64），
+                # 不作为直接股东
+                if '间接' in seg or '实际控制人' in seg:
+                    continue
+                # 仅接受"对发行人本体的直接持股"陈述：桥接文本必须是泛指的
+                # 发行人/公司/股权/比例等措辞（白名单）。出现其它机构名
+                #（"X持有Y公司100%股权"）或代词（"X持有其100%股权"，其指上层
+                # 母公司）时，属于上层持股陈述，不作为直接股东。
+                if bridge and not re.fullmatch(
+                        r'(?:发行人|公司|本公司|标的公司)?(?:的)?(?:股权|股份)?(?:比例)?(?:为)?',
+                        bridge):
+                    continue
+                push_holder(nm_c, ratio_c, src=f'hold{pi}', pos=mm.start())
+
+        # ---------- 2) 文字陈述：控股股东（可能无比例） ----------
+        holder_only_pats = [
+            # task 64：允许"控股股东和实际控制人均为X"这类"均/皆"插入语
+            re.compile(r'(?:发行人|公司)(?:的)?控股股东(?:(?:及|和)实际控制人)?\s*(?:均|皆)?\s*'
+                       r'(?:为|是|系)\s*[^。；，]{0,15}?' + NAME),
+            re.compile(NAME + r'\s*(?:均|皆)?\s*(?:系|为|是)\s*(?:发行人|公司)(?:的)?控股股东'),
+        ]
+        for pat in holder_only_pats:
+            for mm in pat.finditer(flat):
+                seg = mm.group(0)
+                if '实际控制人' in seg and '控股股东' not in seg:
+                    continue
+                push_holder(mm.group(1), None, src=f'only{holder_only_pats.index(pat)}', pos=mm.start())
+
+        # ---------- 3) 文字陈述：实际控制人（含间接持股比例） ----------
+        controller = None
+        controller_ratio = None
+        controller_indirect = False
+        # 3a) 带比例的实控人："X（间接）持有公司Y%股权，为公司实际控制人"
+        # 组：(1)名称 (2)直接/间接 (3)发行人代词 (4)中间主体 (5)比例
+        ctrl_ratio_pats = [
+            re.compile(NAME + r'\s*(直接|间接)?持有(?:(发行人|公司|标的公司))?'
+                       r'([^。；，]{0,45}?)([\d,]+(?:\.\d+)?)\s*%'
+                       r'[^。；]{0,40}?(?:均|皆)?(?:为|是|系)[^。；]{0,8}实际控制人'),
+            # task 64："X通过持有Y公司A%的股权，实现对发行人的实际控制"
+            re.compile(NAME + r'\s*(直接|间接)?[^。；，]{0,10}?持有(?:(发行人|公司|标的公司))?'
+                       r'([^。；，]{0,45}?)([\d,]+(?:\.\d+)?)\s*%[^。；]{0,60}?'
+                       r'(?:均|皆)?(?:为|是|系)[^。；]{0,8}实际控制人'),
+        ]
+        for pat in ctrl_ratio_pats:
+            for mm in pat.finditer(flat):
+                nm = clean_name(mm.group(1))
+                if os.environ.get('EQ_DEBUG'):
+                    print(f"[EQ_DEBUG] ctrl: {mm.group(1)!r} mid={(mm.group(4) or '')!r} "
+                          f"ratio={mm.group(5)!r} seg={mm.group(0)!r}")
+                if valid_name(nm):
+                    mid = clean_name(mm.group(4) or '')
+                    ratio = mm.group(5)
+                    tail = mm.group(0)[mm.end(5) - mm.start(0):]
+                    # "…持有发行人100%的股权，为发行人的控股股东，发行人实际控制人为X"：
+                    # 该句的持有主体是控股股东而非实际控制人，整句跳过（如怀集县锦鹏）
+                    if re.search(r'(?:为|是|系)[^。；，]{0,8}?控股股东', tail):
+                        continue
+                    # "…因此，安吉县财政局（…办公室）为发行人的实际控制人"：
+                    # 句中另起了实际控制人的主语，持有主体并非实际控制人，跳过
+                    if re.search(SUF + r'）?[，,]?(?:均|皆)?(?:为|是|系)[^。；]{0,8}实际控制人', tail):
+                        continue
+                    # 比例若指向链外的中间主体（如"通过持有扬子国资100%股权实现对…实际控制"），
+                    # 不能当作对下一层的持股标注，仅保留控制人名称
+                    if mid and not any(same_entity(mid, h[0]) for h in holders):
+                        ratio = None
+                    controller = nm
+                    controller_indirect = (mm.group(2) == '间接')
+                    controller_ratio = ratio
+                    break
+            if controller:
+                break
+        # 3b) 无比例的实控人（允许省略主语，如"，实际控制人为X"）
+        if not controller:
+            ctrl_pats = [
+                re.compile(r'(?:发行人|公司)?(?:的)?实际控制人\s*(?:均|皆)?\s*(?:为|是|系)\s*[^。；]{0,10}?' + NAME),
+                re.compile(NAME + r'\s*(?:均|皆)?\s*(?:系|为|是)\s*(?:发行人|公司)(?:的)?实际控制人'),
+            ]
+            for pat in ctrl_pats:
+                for mm in pat.finditer(flat):
+                    nm = clean_name(mm.group(1))
+                    if valid_name(nm):
+                        controller = nm
+                        break
+                if controller:
+                    break
+
+        # ---------- 4) 股东表（股东名称 / 出资额 / 持股比例） ----------
+        if len(holders) < 2:
+            for i, l in enumerate(lines):
+                if ('股东名称' in l) or ('股东' in l and re.search(r'(持股比例|出资比例|股权占比)', l)):
+                    j = i + 1
+                    guard = 0
+                    while j < len(lines) and guard < 10 and (
+                            lines[j] in ('序号', '股东名称', '认缴出资额', '实缴出资额', '持股比例',
+                                         '出资额', '股权占比', '股权比例', '认缴出资', '实收资本',
+                                         '注册资本', '%', '（%）', '（万元）')
+                            or re.fullmatch(r'[\d,]+(?:\.\d+)?%?', lines[j] or '')):
+                        j += 1
+                        guard += 1
+                    while j < len(lines) and '合计' not in lines[j]:
+                        nm = lines[j]
+                        if len(nm) >= 4 and not re.search(r'\d', nm) \
+                                and re.search(SUF + r'）?$', nm) \
+                                and not re.search(r'如下|所示|单位|成立于|年度|年末|关于', nm):
+                            nums = []
+                            k = j + 1
+                            while k < len(lines) and len(nums) < 6 and \
+                                    re.fullmatch(r'[\d,]+(?:\.\d+)?%?', lines[k] or ''):
+                                nums.append(lines[k].rstrip('%'))
+                                k += 1
+                            if nums:
+                                push_holder(nm, nums[-1], src='table')
+                                j = k
+                                continue
+                        j += 1
+
+        # ---------- 5) 股权结构图（文本层图形文字） ----------
+        diagram = []  # [(name, ratio or None)] 自上而下
+        try:
+            seg_start = -1
+            for m in re.finditer(r'股权结构图|股权结构如下|股权结构如右', txt):
+                seg_start = m.end()
+            if seg_start >= 0:
+                seg = txt[seg_start:seg_start + 1800]
+                seg = seg.split('（二）')[0].split('(二)')[0].split('四、')[0]
+                for raw in seg.split('\n'):
+                    ls = raw.strip()
+                    if not ls:
+                        continue
+                    if re.fullmatch(r'[\d,]+(?:\.\d+)?%', ls):
+                        # 比例文字紧跟其上方实体 → 归属上一个实体
+                        if diagram and diagram[-1][1] is None:
+                            diagram[-1] = (diagram[-1][0], ls.rstrip('%'))
+                        continue
+                    if re.search(SUF, ls) and len(ls) <= 45 and not re.search(r'\d', ls) \
+                            and not re.search(r'如下|所示|图[:：]|表[:：]|单位', ls):
+                        nm = clean_name(ls)
+                        if valid_name(nm):
+                            diagram.append((nm, None))
+        except Exception:
+            diagram = []
+
+        # ---------- 5.5) 剔除历史股东（报告期内被更名/划转/变更的主体） ----------
+        # 出现在正文后段的股东若处在"变更为/原控股股东/无偿划转"等变更语境中，
+        # 属于报告期内已退出的历史股东，不应计入当前股权结构（如泰州凤城）。
+        if len(holders) > 1 and holder_pos:
+            first_pos = min(holder_pos.values())
+            kept_holders = []
+            for nm, ratio in holders:
+                pos = holder_pos.get(nm, first_pos)
+                if pos > first_pos + 300:
+                    ctx = flat[max(0, pos - 120): pos + 120]
+                    if re.search(r'变更为|原控股股东|更名为|无偿划转|转让给|受让|变更为发行人', ctx):
+                        if os.environ.get('EQ_DEBUG'):
+                            print(f"[EQ_DEBUG] 剔除历史股东: {nm!r} @{pos}")
+                        continue
+                kept_holders.append((nm, ratio))
+            holders = kept_holders
+
+        # ---------- 6) 组装链条（按层级渲染） ----------
+        if not holders and diagram:
+            for nm, ratio in diagram:
+                if is_issuer(nm):
+                    continue
+                if not any(same_entity(nm, h[0]) for h in holders):
+                    holders.append((nm, ratio))
+
+        if os.environ.get('EQ_DEBUG'):
+            print(f"[EQ_DEBUG] holders={holders!r} controller={controller!r} "
+                  f"ctrl_ratio={controller_ratio!r} indirect={controller_indirect} "
+                  f"diagram={diagram!r}")
+            k = flat.find('控股股东为')
+            if k < 0:
+                k = flat.find('控股股东')
+            print(f"[EQ_DEBUG] flat片段: {flat[k:k + 120]!r}")
+            for kw in ('实际控制人为', '实际控制人均为'):
+                k2 = flat.find(kw)
+                if k2 >= 0:
+                    print(f"[EQ_DEBUG] ctrl片段: {flat[k2:k2 + 60]!r}")
+                    break
+            print(f"[EQ_DEBUG] push轨迹: {holder_trace!r}")
+
+        # 实际控制人若同时被正文表述为"持有发行人100%股权"的直接股东，
+        # 且还存在其他直接股东，说明其系通过该股东间接持股：提升为最上层，
+        # 不与其他直接股东并列（如抚州高新区智城）。
+        if controller and valid_name(controller) and len(holders) > 1:
+            rest = [(nm, r) for nm, r in holders if not same_entity(nm, controller)]
+            if rest:
+                holders = rest
+
+        if not holders:
+            return "（待提取）"
+
+        # 实际控制人补到最上层（与直接股东不同、且非发行人本身时）
+        levels = []  # [[(name, ratio_str), ...], ...] 自上而下
+        if controller and valid_name(controller) and not is_issuer(controller):
+            if not any(same_entity(controller, h[0]) for h in holders):
+                ctrl_label = f"间接 {controller_ratio}" if (controller_indirect and controller_ratio) \
+                    else (controller_ratio if controller_ratio else None)
+                levels.append([(controller, ctrl_label)])
+        levels.append(list(holders))
+
+        out = ["```", "股权架构:", ""]
+        first = True
+        for lvl in levels:
+            for i, (nm, ratio) in enumerate(lvl):
+                prefix = "┌─" if first else "├─"
+                first = False
+                rs = f" ({ratio}%)" if ratio else ""
+                out.append(f"{prefix} {nm}{rs}")
+            out.append("│")
+            out.append("▼")
+        out.append(f"└─ {issuer}")
+        out.append("```")
+        return '\n'.join(out)
+
     def _extract_equity_structure_within_section(self) -> str:
         """
         从"三、发行人的股权结构"章节中精确提取股权结构
@@ -1165,6 +1587,14 @@ class IssuerProfileExtractor(BaseExtractor):
             "（三）股权结构",
             "三、发行人控股股东及实际控制人情况",
             "三、控股股东及实际控制人情况",
+            # task 64：更多章节标题变体
+            "三、发行人控股股东及实际控制人的基本情况",
+            "三、发行人控股股东和实际控制人情况",
+            "三、发行人控股股东、实际控制人情况",
+            "二、发行人股权结构",
+            "二、发行人的股权结构",
+            "四、发行人股权结构",
+            "发行人股权结构及实际控制人情况",
         ]
         section_start_idx = -1
 
@@ -1208,8 +1638,19 @@ class IssuerProfileExtractor(BaseExtractor):
                 break
 
         if section_start_idx < 0:
-            # 如果找不到"三、股权结构"，尝试从第四节直接提取
-            return self._extract_equity_from_section_four()
+            # 找不到编号章节标题时（task 64），退化为"（一）股权结构"锚点定位
+            anchor = -1
+            for m in re.finditer(r'[（(][一二][)）]\s*(?:发行人)?股权结构', processed_text):
+                ctx = processed_text[m.start():m.start() + 300]
+                if '....' in ctx[:200] or re.search(r'\.{4,}\s*\d+', ctx[:200]):
+                    continue  # 目录行
+                anchor = m.start()
+                break
+            if anchor >= 0:
+                section_start_idx = anchor
+            else:
+                # 最后尝试从第四节直接提取
+                return self._extract_equity_from_section_four()
 
         # 找到"三、"的结束位置
         section_end_patterns = [
@@ -1231,6 +1672,15 @@ class IssuerProfileExtractor(BaseExtractor):
 
         if len(section_text.strip()) < 30:
             return "（待提取）"
+
+        # task 64：优先用"完整股权链"提取（文字陈述 + 股东表 + 股权结构图），
+        # 成功则直接返回；失败时回落到原有单层持股提取逻辑
+        try:
+            complete_chain = self._extract_equity_chain_complete(section_text)
+            if complete_chain and complete_chain != "（待提取）":
+                return complete_chain
+        except Exception as e:
+            print(f"  完整股权链提取失败，回退旧逻辑: {e}")
 
         # 在章节内精确定位"（一）股权结构"
         equity_start_patterns = [
