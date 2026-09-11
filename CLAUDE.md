@@ -28,9 +28,12 @@ ocvault/
     │   ├── config.py      # 正则模式配置
     │   ├── utils.py       # 工具函数
     │   └── equity_paddle_ocr.py  # 股权架构图 OCR
-    ├── run_all.py         # 批量运行入口
+    ├── extract_bond_terms.py / extract_fund_usage.py / extract_issuer_profile.py
+    │   / extract_business_analysis.py / extract_financial_analysis.py  # 5 类提取器
+    ├── run_all.py         # 批量运行入口（提取 + 索引 + 数据校验）
     ├── generate_meta_index.py  # 生成静态索引（可被 Dataview 替代）
-    └── migrate_frontmatter.py  # 一次性 frontmatter 迁移脚本
+    ├── validator.py       # 笔记数据一致性校验（run_all 调用）
+    └── verify_all.py      # 全量验证：脚本输出与 knowledge/ 逐篇对比
 ```
 
 **命名约定**: `{发行人全称}-{内容类型}.md`
