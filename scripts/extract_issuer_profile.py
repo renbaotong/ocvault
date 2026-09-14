@@ -39,6 +39,63 @@ class IssuerProfileExtractor(BaseExtractor):
     def __init__(self, pdf_path: str):
         super().__init__(pdf_path)
 
+    @staticmethod
+    def _compact_index(text: str):
+        """去掉全部空白字符，并记录每个保留字符在原文中的下标，
+        用于在"标题被换行/空格拆开"的情况下定位章节（task 66）。"""
+        chars, idxs = [], []
+        for i, ch in enumerate(text):
+            if ch.isspace():
+                continue
+            chars.append(ch)
+            idxs.append(i)
+        idxs.append(len(text))
+        return ''.join(chars), idxs
+
+    def _locate_section_tolerant(self, after_pattern: str, start_patterns: list, end_patterns: list):
+        """在"去空白"文本中定位章节，返回 (start_orig, end_orig)；未找到返回 (-1, -1)。
+
+        原文中标题常被排版拆行（如"一、" + 换行 + "发行人基本情况"），
+        字面量查找会失败，导致整节取空（task 66：佛山市高明发展投资建设集团）。
+        """
+        compact, cmap = self._compact_index(self.full_text)
+
+        base_c = 0
+        if after_pattern:
+            ap = re.sub(r'\s+', '', after_pattern)
+            if ap:
+                j = compact.find(ap)
+                if j >= 0:
+                    base_c = j + len(ap)
+
+        for pattern in start_patterns:
+            cp = re.sub(r'\s+', '', pattern)
+            if not cp:
+                continue
+            pos = compact.find(cp, base_c)
+            while pos >= 0:
+                after_c = compact[pos + len(cp): pos + len(cp) + 200].lstrip(' \t')
+                # 跳过目录条目（点号+页码，或引用性后缀）
+                if after_c.startswith('....') or after_c[:1] in ['"', '"', "'", "'", '之', ',', '，']:
+                    pos = compact.find(cp, pos + 1)
+                    continue
+                break
+            if pos < 0:
+                continue
+
+            end_c = len(compact)
+            for ep in end_patterns:
+                ecp = re.sub(r'\s+', '', ep)
+                if not ecp:
+                    continue
+                j = compact.find(ecp, pos + 10)
+                if j > pos:
+                    end_c = min(end_c, j)
+            end_orig = cmap[end_c] if end_c < len(cmap) else len(self.full_text)
+            return cmap[pos], end_orig
+
+        return -1, -1
+
     def _extract_section_after(self, after_pattern: str, start_patterns: list, end_patterns: list) -> str:
         """在某个模式之后提取章节内容 - 增强版，跳过 TOC 引用"""
         self.extract_text()
@@ -54,9 +111,9 @@ class IssuerProfileExtractor(BaseExtractor):
                 # 检查是否是 TOC 条目（后面跟大量点号+页码）
                 next_chars = self.full_text[idx:idx + 200]
                 next_clean = next_chars.replace('\n', '')
-                # TOC 特征：紧跟 pattern 后有 4+ 个点号
+                # TOC 特征：紧跟 pattern 后有 4+ 个点号（含"·""．""…"等目录点）
                 after_text = next_clean[len(pattern):]
-                has_toc_dots = after_text.lstrip(' \t').startswith('....')
+                has_toc_dots = bool(re.match(r'[.·．…]{4,}', after_text.lstrip(' \t')))
                 has_toc_ref = after_text.lstrip(' \t')[:1] in ['"', '\"', "'", "'", '之', ',', '，']
                 if has_toc_dots or has_toc_ref:
                     continue
@@ -85,13 +142,18 @@ class IssuerProfileExtractor(BaseExtractor):
                         next_chars = self.full_text[idx:idx + 200]
                         next_clean = next_chars.replace('\n', '')
                         after_text = next_clean[len(pattern):]
-                        has_toc_dots = after_text.lstrip(' \t').startswith('....')
+                        has_toc_dots = bool(re.match(r'[.·．…]{4,}', after_text.lstrip(' \t')))
                         if has_toc_dots:
                             continue
                         start_idx = idx
                         break
 
         if start_idx < 0:
+            # task 66：标题被换行/空格拆开时（如"一、" + 换行 + "发行人基本情况"），
+            # 回到"去空白"文本中定位，避免整节取空
+            tol_start, tol_end = self._locate_section_tolerant(after_pattern, start_patterns, end_patterns)
+            if tol_start >= 0:
+                return self.full_text[tol_start:tol_end]
             return ""
 
         end_idx = len(self.full_text)
@@ -131,8 +193,8 @@ class IssuerProfileExtractor(BaseExtractor):
 
         # 1. 提取注册名称
         name_patterns = [
-            r'(?:注册名称|公司名称|企业名称)\s*[:：|]\s*\n?\s*([\s\S]+?)(?=\n\s*(?:法定代表|注册资本|实缴资本|设立日期|统一社会信用代码|注册地址|所属行业|经营范围|企业类型|二、|$))',
-            r'(?:注册名称|公司名称|企业名称)\s*[:：|]?\s*\n?\s*([\s\S]+?)(?=\n\s*(?:法定代表|注册资本|实缴资本|设立日期|统一社会信用代码|注册地址|所属行业|经营范围|企业类型|二、|$))',
+            r'(?:注册名称|公司名称|企业名称)\s*[:：|]\s*\n?\s*([\s\S]+?)(?=\n\s*(?:法定代表|注册资本|实缴资本|设立日期|统一社会信用代码|注册地址|所属行业|经营范围|企业类型|股票代码|网址|二、|$))',
+            r'(?:注册名称|公司名称|企业名称)\s*[:：|]?\s*\n?\s*([\s\S]+?)(?=\n\s*(?:法定代表|注册资本|实缴资本|设立日期|统一社会信用代码|注册地址|所属行业|经营范围|企业类型|股票代码|网址|二、|$))',
         ]
         for pattern in name_patterns:
             for st in search_texts:
@@ -148,8 +210,8 @@ class IssuerProfileExtractor(BaseExtractor):
 
         # 2. 提取注册资本
         capital_patterns = [
-            r'注册资本\s*[:：|]\s*\n?\s*人民币?\s*\n?\s*([\d,\.]+)\s*\n?\s*(万[元]?|亿[元]?|元)',
-            r'注册资本\s*[:：|]\s*\n?\s*([\d,\.]+)\s*\n?\s*(万[元]?|亿[元]?|元)',
+            r'注册资本\s*[:：|]\s*\n?\s*人民币?\s*\n?\s*([\d,\.]+)\s*\n?\s*[:：]?\s*\n?\s*(万[元]?|亿[元]?|元)',
+            r'注册资本\s*[:：|]\s*\n?\s*([\d,\.]+)\s*\n?\s*[:：]?\s*\n?\s*(万[元]?|亿[元]?|元)',
             r'注册资本\s*[:：|]\s*\n?\s*(?:为)?\s*\n?\s*人民币?\s*\n?\s*([\d,\.]+)',
             # 表格格式：注册资本 | 人民币X亿元 或 注册资本 | X亿元
             r'注册资本\s*\|?\s*人民币\s*([\d,\.]+)\s*(万|亿)?元?',
@@ -178,8 +240,8 @@ class IssuerProfileExtractor(BaseExtractor):
 
         # 3. 提取实缴资本（同时支持"实缴资本"和"实收资本"）
         paid_in_patterns = [
-            r'(?:实缴资本|实收资本)\s*[:：|]\s*\n?\s*人民币?\s*\n?\s*([\d,\.]+)\s*\n?\s*(万[元]?|亿[元]?|元)',
-            r'(?:实缴资本|实收资本)\s*[:：|]\s*\n?\s*([\d,\.]+)\s*\n?\s*(万[元]?|亿[元]?|元)',
+            r'(?:实缴资本|实收资本)\s*[:：|]\s*\n?\s*人民币?\s*\n?\s*([\d,\.]+)\s*\n?\s*[:：]?\s*\n?\s*(万[元]?|亿[元]?|元)',
+            r'(?:实缴资本|实收资本)\s*[:：|]\s*\n?\s*([\d,\.]+)\s*\n?\s*[:：]?\s*\n?\s*(万[元]?|亿[元]?|元)',
             r'(?:实缴资本|实收资本)\s*[:：|]\s*\n?\s*(?:为)?\s*\n?\s*人民币?\s*\n?\s*([\d,\.]+)',
             # 表格格式：实收资本 | 人民币X亿元 或 实缴资本 | X亿元
             r'(?:实缴资本|实收资本)\s*\|?\s*人民币\s*([\d,\.]+)\s*(万|亿)?元?',
@@ -214,6 +276,17 @@ class IssuerProfileExtractor(BaseExtractor):
                     break
             if result["实缴资本"]:
                 break
+
+        # 3b) 兜底：基本信息章节未列示实缴资本时，用全文"发行人注册资本X，实缴资本Y"
+        #     的表述补齐（限定主语为发行人/本公司，避免误取子公司数据）
+        #     task 66：佛山市高明的概况表未列实缴资本，风险章节披露为 1.14 亿元
+        if not result["实缴资本"]:
+            flat = re.sub(r'\s+', '', self.full_text or '')
+            fm = re.search(
+                r'(?:发行人|本公司)\s*注册资本\s*[:：]?\s*[\d,\.]+\s*(?:万元|亿元|万|亿|元)'
+                r'[，,；;]\s*实缴资本\s*[:：]?\s*([\d,\.]+)\s*(万元|亿元|万|亿|元)', flat)
+            if fm:
+                result["实缴资本"] = fm.group(1) + fm.group(2)
 
         # 4. 提取设立日期
         for st in search_texts:
@@ -393,7 +466,7 @@ class IssuerProfileExtractor(BaseExtractor):
                           '实收资本', '设立日期', '成立日期', '统一社会信用代码',
                           '住所', '注册地址', '邮政编码', '所属行业', '经营范围',
                           '信息披露事务负责人', '设立（工商注册）日期', '企业类型',
-                          '公司注册地址', '联系人', '电话号码', '传真号码']
+                          '公司注册地址', '联系人', '电话号码', '传真号码', '股票代码']
         lines = text.split('\n')
         result = []
         i = 0
@@ -405,6 +478,12 @@ class IssuerProfileExtractor(BaseExtractor):
                     matched_field = kw
                     break
             if matched_field and i + 1 < len(lines):
+                # 标签行本身可能已带值（如"经营范围：对工程项目的投资及管理、…"），
+                # 该值必须保留，否则会被下一行的合并结果覆盖丢失（task 66：佛山市高明）
+                inline = ''
+                mm = re.match(r'^.*?' + re.escape(matched_field) + r'\s*[:：|]\s*(.+)$', line)
+                if mm:
+                    inline = mm.group(1).strip()
                 # 合并从下一行开始的值（可能跨多行直到遇到下一个字段名或截止词）
                 value_lines = []
                 j = i + 1
@@ -422,7 +501,7 @@ class IssuerProfileExtractor(BaseExtractor):
                         break
                     value_lines.append(next_line)
                     j += 1
-                value = ' '.join(value_lines)
+                value = ' '.join(([inline] if inline else []) + value_lines)
                 if value:
                     result.append(f"{matched_field}: {value}")
                 else:
