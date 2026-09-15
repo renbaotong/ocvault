@@ -1690,9 +1690,13 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
 
         # ===== 兜底 for 乱码PDF：直接使用列结构和数据特征判断表格类型 =====
         # 当关键字匹配失败时（乱码PDF），用列数和金额数据特征识别
-        # 如果 revenue 为空而 margin 不为空，说明可能是乱码PDF导致的误判，清除margin重建
+        # 如果 revenue 为空而 margin 不为空，说明可能是乱码PDF导致的误判，清除margin重建。
+        # 例外（task 68）：margin 已含"主营收入/毛利润/毛利率"等业务口径行时是有效结果，
+        # 不清空——否则会被"原材料采购价格"之类无关表格覆盖（江苏风行天下）。
         _garbled_done = False
-        if not result.get('revenue') and result.get('margin'):
+        _margin_txt = result.get('margin') or ''
+        _margin_valid = bool(re.search(r'毛利率|毛利润|主营收入|业务板块', _margin_txt))
+        if not result.get('revenue') and result.get('margin') and not _margin_valid:
             result['margin'] = ''
         if not result.get('revenue') or not result.get('margin'):
             for pn, ti, tbl, pt, si in page_data:
@@ -1899,6 +1903,10 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
                         needed_types.discard('cost')
                         print(f"  [兜底] 识别到 cost 表格 (金额/占比+营业成本上下文, 第{page_num + 1}页)")
                         continue
+
+        # task 68：拆分"科目/业务类型"型合并表（主营收入/主营成本/主营毛利润/主营毛利率），
+        # 避免营业收入与毛利率重复整表、营业成本空置（江苏风行天下）
+        result = self._split_income_cost_blocks(result)
 
         return result
 
@@ -3022,7 +3030,8 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
         """
         if not table or len(table) < 2:
             return False
-        invest_keywords = ['投资收益', '股权投资', '股权转让收益', '处置长期股权投资', '股权投资基金']
+        invest_keywords = ['投资收益', '股权投资', '股权转让', '处置长期股权投资', '股权投资基金',
+                           '权益法', '分红收益', '分红收入']
         data_cells = []
         for row in table[1:]:
             if row and row[0] and row[0].strip():
@@ -3035,6 +3044,65 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
             return False
         matched = sum(1 for c in data_cells if any(kw in c for kw in invest_keywords))
         return matched >= 2 and matched >= len(data_cells) * 0.75
+
+    # task 68：合并表的段标签 → 目标字段
+    _INCOME_BLOCK_LABELS = ('主营收入', '营业收入', '主营业务收入')
+    _COST_BLOCK_LABELS = ('主营成本', '营业成本', '主营业务成本')
+    _PROFIT_BLOCK_LABELS = ('主营毛利润', '毛利润', '营业毛利润')
+    _MARGIN_BLOCK_LABELS = ('主营毛利率', '毛利率', '营业毛利率')
+
+    def _split_income_cost_blocks(self, result: Dict[str, str]) -> Dict[str, str]:
+        """task 68：拆分"科目/业务类型"型合并表（主营收入/主营成本/主营毛利润/主营毛利率）。
+
+        江苏风行天下等发行人的"报告期内发行人主营业务情况"是一张合并表：首列依次为
+        主营收入 / 主营成本 / 主营毛利润 / 主营毛利率，每段内按业务类型列金额与占比。
+        原流程会把整表同时作为营业收入与毛利率，而营业成本空置。此处按段拆分：
+        收入段 → revenue，成本段 → cost，毛利润段+毛利率段 → margin。
+        """
+        rev = result.get('revenue') or ''
+        if '主营收入' not in rev or '主营成本' not in rev or '主营毛利率' not in rev:
+            return result
+
+        lines = [ln for ln in rev.split('\n') if ln.strip()]
+        if len(lines) < 4:
+            return result
+        header = lines[:2]  # 表头行 + 分隔行
+
+        blocks = []          # [(label, [md rows])]
+        cur = None
+        for ln in lines[2:]:
+            if not ln.lstrip().startswith('|'):
+                continue
+            parts = ln.split('|')
+            first = parts[1].strip() if len(parts) > 2 else ''
+            if first in (self._INCOME_BLOCK_LABELS + self._COST_BLOCK_LABELS +
+                         self._PROFIT_BLOCK_LABELS + self._MARGIN_BLOCK_LABELS):
+                cur = [first, []]
+                blocks.append(cur)
+            if cur is not None:
+                cur[1].append(ln)
+
+        income_rows, cost_rows, profit_rows, margin_rows = [], [], [], []
+        for label, rows in blocks:
+            if not rows:
+                continue
+            if label in self._INCOME_BLOCK_LABELS:
+                income_rows += rows
+            elif label in self._COST_BLOCK_LABELS:
+                cost_rows += rows
+            elif label in self._PROFIT_BLOCK_LABELS:
+                profit_rows += rows
+            elif label in self._MARGIN_BLOCK_LABELS:
+                margin_rows += rows
+
+        if not income_rows:
+            return result
+        result['revenue'] = '\n'.join(header + income_rows)
+        if cost_rows:
+            result['cost'] = '\n'.join(header + cost_rows)
+        if profit_rows or margin_rows:
+            result['margin'] = '\n'.join(header + profit_rows + margin_rows)
+        return result
 
     def _is_total_continuation_row(self, table: List[List[str]]) -> bool:
         """
