@@ -304,6 +304,11 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
             r'营业毛利率构成',
             r'营业毛利润构成',
             r'各业务板块.*毛利润及毛利率',
+            # task 70：东营垦利式披露——"发行人主营业务收入明细表/成本明细表/
+            # 毛利润及毛利率明细表"，列名为"收入/成本/毛利润 + 占比"（无"金额"列）
+            r'主营业务(?:收入|成本)\s*明细表',
+            r'主营业务毛利润及毛利率明细表',
+            r'主营业务(?:收入|成本|毛利润).{0,6}明细',
         ]
 
         for pattern in standard_section_patterns:
@@ -320,6 +325,12 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
         if '业务板块' in text and '金额' in text and '占比' in text:
             if re.search(r'202[2345]', text):
                 return True
+
+        # task 70：表头为"收入/成本/毛利润/毛利率 + 占比"（无"金额"列）的分板块明细表页
+        # （东营垦利："收入/占比/成本/占比/毛利润/占比/毛利率" 三段式明细表）
+        if re.search(r'(?:收入|成本|毛利润|毛利率)\s*\n?\s*占比', text) and \
+                ('主营业务' in text or '业务板块' in text or '合计' in text):
+            return True
 
         return False
 
