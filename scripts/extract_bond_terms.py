@@ -28,6 +28,11 @@ class BondTermsExtractor(BaseExtractor):
     OUTPUT_DIR = "01-发行条款"
     TAGS = ["债券/发行条款"]
 
+    # task 74：年/月/日三段数字，允许被【】/[]/（）与空白包裹
+    _DATE_GROUPS = (r'[【\[（(]?\s*(\d{4})\s*[】\]）)]?\s*年\s*'
+                    r'[【\[（(]?\s*(\d{1,2})\s*[】\]）)]?\s*月\s*'
+                    r'[【\[（(]?\s*(\d{1,2})\s*[】\]）)]?\s*日')
+
     def __init__(self, pdf_path: str):
         super().__init__(pdf_path)
 
@@ -194,12 +199,49 @@ class BondTermsExtractor(BaseExtractor):
         info["lead_underwriter"] = underwriters["lead_underwriter"]
         info["co_underwriter"] = underwriters["co_underwriter"]
 
+        # task 74：发行日期精确到年月日（优先"发行首日/发行日期"，其次"起息日"）
+        info["issue_date"] = (self._extract_issue_date(section_text)
+                              or self._extract_issue_date(clean)
+                              or self._extract_value_date(section_text)
+                              or self._extract_value_date(clean))
+
         required = ["issuer", "bond_type"]
         missing = validate_extraction(info, required)
         if missing:
             self._logger.warning(f"缺失字段：{missing}")
 
         return info
+
+    def _extract_issue_date(self, text: str) -> str:
+        """提取"发行首日/发行日期"（精确到年月日，task 74）。
+
+        日期数字常被【】、[]、（）等括号包裹
+        （如"发行首日：【2026】年【6】月【24】日"）；找不到返回空串。
+        """
+        if not text:
+            return ''
+        patterns = [
+            r'发行首日\s*[：:]\s*' + self._DATE_GROUPS,
+            r'发行日期\s*[：:]\s*' + self._DATE_GROUPS,
+            r'发行首日\s*(?:为|是)\s*' + self._DATE_GROUPS,
+            r'发行日期\s*(?:为|是)\s*' + self._DATE_GROUPS,
+        ]
+        for pat in patterns:
+            m = re.search(pat, text)
+            if m:
+                return f"{m.group(1)}年{int(m.group(2))}月{int(m.group(3))}日"
+        return ''
+
+    def _extract_value_date(self, text: str) -> str:
+        """提取"起息日"（发行日期兜底口径，task 74）"""
+        if not text:
+            return ''
+        pat = (r'起息日期?\s*[：:]?\s*(?:本期债券的?起息日为|本次债券的?起息日为)?\s*'
+               + self._DATE_GROUPS)
+        m = re.search(pat, text)
+        if m:
+            return f"{m.group(1)}年{int(m.group(2))}月{int(m.group(3))}日"
+        return ''
 
     def _extract_register_scale(self, clean_text: str) -> tuple:
         """提取注册规模（从无异议函）"""
@@ -995,7 +1037,7 @@ class BondTermsExtractor(BaseExtractor):
 | 发行人全称 | {info['issuer']} |
 | 债券全称 | {bond_full_name} |
 | 债券简称 | {bond_short} |
-| 发行日期 | {info['year'].replace('年', '')}年 |
+| 发行日期 | {info.get('issue_date') or (info['year'].replace('年', '') + '年')} |
 | 注册规模 | {info['register_scale'] or '/'} {register_note if register_note else ''} |
 | 本期发行规模 | {info['issue_scale'] or '/'} |
 | 债券期限 | {info['bond_term'] or '/'} |
