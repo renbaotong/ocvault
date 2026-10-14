@@ -687,7 +687,10 @@ class FinancialAnalysisExtractor(BaseExtractor):
                         r"(\d{4})年(\d{1,2})月末",
                         r"(\d{4})年度/末",
                         r"(\d{4})年末",
-                        r"(\d{4})/(\d{1,2})/(\d{1,2})"]:
+                        r"(\d{4})/(\d{1,2})/(\d{1,2})",
+                        # task 73：ISO 短横线/点分隔日期（如"2025-12-31"）
+                        r"(\d{4})\s*-\s*(\d{1,2})\s*-\s*(\d{1,2})",
+                        r"(\d{4})\s*\.\s*(\d{1,2})\s*\.\s*(\d{1,2})"]:
             matches = re.findall(pattern, combined_text)
             if matches:
                 for m in matches:
