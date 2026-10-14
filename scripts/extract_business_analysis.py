@@ -1480,7 +1480,10 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
                             '现金小计', '现金流入', '现金流出', '资金筹措',
                             '债券本息', '收回投资', '分配股利', '偿付利息'
                         ])
-                        if not has_future_years and not has_cashflow_proj:
+                        # task 74：排除只有标题/表头的残片表（响水港兴的收入表头单独成表，
+                        # 抢占了 revenue，导致真正的收入数据表被跳过）
+                        if (not has_future_years and not has_cashflow_proj
+                                and self._has_numeric_data_row(table)):
                             result['revenue'] = self._format_table_to_markdown_v3(table)
                             print(f"  识别到 revenue 表格 (位置推断, 第{page_num + 1}页)")
                             continue
@@ -1568,7 +1571,8 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
                     force_cost = is_profit_amount and is_margin_skip
 
                     table_type = self._identify_table_type_v3(table, section_info, result, page_text, force_cost=force_cost)
-                    if table_type and not result[table_type]:
+                    # task 74：只有标题/表头、没有数据行的残片表不作为任何类型占位
+                    if table_type and not result[table_type] and self._has_numeric_data_row(table):
                         result[table_type] = self._format_table_to_markdown_v3(table)
                         print(f"  识别到 {table_type} 表格 (第{page_num + 1}页)")
 
@@ -3086,7 +3090,23 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
         return names
 
     @staticmethod
-    def _table_row_names(table):
+    def _has_numeric_data_row(table) -> bool:
+        """表格是否含真正的数据行（存在"纯数字且非年份"的单元格）。
+
+        task 74：募集说明书中收入/成本表的表头常单独落在上一页成为 2 行残片表
+        （标题行 + 列名行），若被当作数据表占位，真正的数据表就会被跳过
+        （响水县港兴：营业收入为空）。
+        """
+        if not table:
+            return False
+        for row in table[1:]:
+            for cell in row:
+                s = str(cell).replace(',', '').strip() if cell else ''
+                if re.fullmatch(r'-?\d+(?:\.\d+)?%?', s) and not re.fullmatch(r'(?:19|20)\d{2}', s):
+                    return True
+        return False
+
+    def _table_row_names(self, table):
         """表格首列的业务名称（数据行）"""
         names = []
         for row in table[2:]:
