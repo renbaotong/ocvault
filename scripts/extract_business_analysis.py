@@ -507,6 +507,12 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
         terminal_markers = ['综合毛利率', '综合毛利', '合计毛利率', '小计', '合计', '总计']
         if any(kw in prev_last_row_text for kw in terminal_markers):
             return False
+        # task 72：最后一行首列恰为"综合/平均"等汇总标签时，同样视为表格终结行，
+        # 不再与下一页的新表合并（安徽永望：主营业务毛利润及毛利率表末行"综合"，
+        # 被误与下一页"资产名称/收入金额"表合并，导致毛利率表整体丢失）
+        prev_last_first = (prev_last_row[0] or '').strip() if prev_last_row else ''
+        if prev_last_first in ('综合', '综合毛利率', '综合毛利', '平均值', '平均'):
+            return False
 
         # 新增：阻止合并人员信息表（董事、监事、高级管理人员等）
         # 人员信息表的表头包含"姓名"、"职务"等关键词，不应与财务数据表合并
@@ -1919,6 +1925,10 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
         # 避免营业收入与毛利率重复整表、营业成本空置（江苏风行天下）
         result = self._split_income_cost_blocks(result)
 
+        # task 72：按"业务板块行标签与收入表一致"补齐/修正 cost 与 margin
+        # （安徽永望：收入/成本/毛利率三张同构表，成本表页缺关键词、毛利率表未归类）
+        result = self._fill_cost_margin_by_revenue_rows(page_data, result)
+
         return result
 
     def _get_bond_year(self) -> int:
@@ -3061,6 +3071,95 @@ class BusinessAnalysisExtractorV3(BaseExtractor):
     _COST_BLOCK_LABELS = ('主营成本', '营业成本', '主营业务成本')
     _PROFIT_BLOCK_LABELS = ('主营毛利润', '毛利润', '营业毛利润')
     _MARGIN_BLOCK_LABELS = ('主营毛利率', '毛利率', '营业毛利率')
+
+    @staticmethod
+    def _md_row_names(md: str):
+        """markdown 表格首列的业务名称集合（排除表头/合计/分隔行）"""
+        names = set()
+        for m in re.findall(r'^\|\s*([^|]+?)\s*\|', md or '', re.M):
+            n = m.strip()
+            if not n or n in ('合计', '小计', '总计', '项目', '序号', '科目', '业务类型'):
+                continue
+            if set(n) <= set('-: '):
+                continue
+            names.add(n)
+        return names
+
+    @staticmethod
+    def _table_row_names(table):
+        """表格首列的业务名称（数据行）"""
+        names = []
+        for row in table[2:]:
+            if row and row[0]:
+                c = str(row[0]).strip()
+                if c and c not in ('合计', '小计', '总计', '项目', '序号') and not re.match(r'^\d+$', c):
+                    names.append(c)
+        return names
+
+    @staticmethod
+    def _table_max_value(table):
+        """表格数值列的最大绝对值（用于区分金额表与百分比表）"""
+        mx = 0.0
+        for row in table[1:]:
+            for cell in row[1:]:
+                s = str(cell).replace(',', '').strip() if cell else ''
+                if re.fullmatch(r'-?\d+(?:\.\d+)?', s):
+                    mx = max(mx, abs(float(s)))
+        return mx
+
+    def _fill_cost_margin_by_revenue_rows(self, page_data, result: Dict[str, str]) -> Dict[str, str]:
+        """task 72：按"业务板块行标签与收入表一致"补齐/修正 cost 与 margin。
+
+        场景（安徽永望）：募集说明书连续披露"主营业务收入构成情况 / 主营业务成本
+        构成情况 / 主营业务毛利润及毛利率"三张业务板块行标签相同的表。收入表能被
+        正常识别；成本表所在页没有"成本"章节关键词、表头又与收入表完全相同，被识别
+        成 revenue 后跳过；毛利率表也可能没被归类，最终 cost 被后文"客户销售明细"
+        等无关表顶替。此处以收入表的业务行标签为锚，按表格数值量级区分成本表
+        （金额，量级大）与毛利率表（百分比，≤100），补位或纠正。
+        """
+        rev_md = result.get('revenue') or ''
+        rev_names = self._md_row_names(rev_md)
+        if len(rev_names) < 2:
+            return result
+
+        def names_of(table):
+            return self._table_row_names(table)
+
+        def overlap_ok(table):
+            names = names_of(table)
+            if len(names) < 2:
+                return False
+            ov = len(set(names) & rev_names)
+            return ov >= 2 and ov >= len(names) * 0.6
+
+        cost_md = result.get('cost') or ''
+        cost_ok = len(self._md_row_names(cost_md) & rev_names) >= 2
+
+        for page_num, _table_idx, table, page_text, _section_info in page_data:
+            if len(table) < 3:
+                continue
+            if not overlap_ok(table):
+                continue
+            md = self._format_table_to_markdown_v3(table)
+            if md == rev_md:
+                continue
+            page_lower = page_text or ''
+            header = ' '.join(' '.join(r) for r in table[:2])
+            is_margin_like = ('毛利率' in header or '毛利润' in header) and '成本' not in header
+            if is_margin_like or self._table_max_value(table) <= 100:
+                # 百分比表 → 毛利率（要求本页确有毛利/毛利率上下文，且不能与成本表同表；
+                # 杭州临空：营业成本表金额仅 39.16 万元，曾被误当作毛利率表）
+                if (not result.get('margin') and md != (result.get('cost') or '')
+                        and ('毛利' in page_lower or '毛利' in header)):
+                    result['margin'] = md
+                    print(f"  识别到 margin 表格 (业务口径补位, 第{page_num + 1}页)")
+                continue
+            # 金额表 → 营业成本（要求本页确有成本上下文，避免把另一张收入表当成成本）
+            if not cost_ok and '成本' in page_lower:
+                result['cost'] = md
+                cost_ok = True
+                print(f"  识别到 cost 表格 (业务口径补位, 第{page_num + 1}页)")
+        return result
 
     def _split_income_cost_blocks(self, result: Dict[str, str]) -> Dict[str, str]:
         """task 68：拆分"科目/业务类型"型合并表（主营收入/主营成本/主营毛利润/主营毛利率）。
