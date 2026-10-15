@@ -54,10 +54,12 @@ class NoteInfo:
     bond_short: str = ""
     bond_type: str = ""
     year: str = ""
+    issue_date: str = ""   # task 75：完整发行日期（YYYY年M月D日）
     issue_scale: str = ""
     bond_term: str = ""
     guarantee: str = ""
     credit_rating: str = ""
+    segments: List[str] = field(default_factory=list)  # task 75：主营业务板块
 
 
 class MetaIndexGenerator:
@@ -108,7 +110,7 @@ class MetaIndexGenerator:
             # 从内容中提取债券简称（从表格中）
             bond_short = ""
             if "01-发行条款" in md_path:
-                match = re.search(r'\| 债券简称 \| (.+?) \|', content)
+                match = re.search(r'\|\s*债券简称\s*\|\s*(.+?)\s*\|', content)
                 if match:
                     bond_short = match.group(1).strip()
 
@@ -144,15 +146,15 @@ class MetaIndexGenerator:
                 dir="01-发行条款",
             )
 
-            # 从表格中提取信息
+            # 从表格中提取信息（允许表格单元格被手工对齐填充，task 75）
             extractors = {
-                'bond_short': r'\| 债券简称 \| (.+?) \|',
-                'bond_type': r'\| 债券类型 \| (.+?) \|',
-                'year': r'\| 发行日期 \| (.+?)年 \|',
-                'issue_scale': r'\| 本期发行规模 \| (.+?) \|',
-                'bond_term': r'\| 债券期限 \| (.+?) \|',
-                'guarantee': r'\| 增信措施 \| (.+?) \|',
-                'credit_rating': r'\| 主体评级 \| (.+?) \|',
+                'bond_short': r'\|\s*债券简称\s*\|\s*(.+?)\s*\|',
+                'bond_type': r'\|\s*债券类型\s*\|\s*(.+?)\s*\|',
+                'issue_date': r'\|\s*发行日期\s*\|\s*(.+?)\s*\|',
+                'issue_scale': r'\|\s*本期发行规模\s*\|\s*(.+?)\s*\|',
+                'bond_term': r'\|\s*债券期限\s*\|\s*(.+?)\s*\|',
+                'guarantee': r'\|\s*增信措施\s*\|\s*(.+?)\s*\|',
+                'credit_rating': r'\|\s*主体评级\s*\|\s*(.+?)\s*\|',
             }
 
             for attr, pattern in extractors.items():
@@ -163,10 +165,101 @@ class MetaIndexGenerator:
                     if val and val != '/':
                         setattr(data, attr, val)
 
+            # task 75：由完整发行日期派生年份（索引按年月统计与展示）
+            m = re.match(r'(\d{4})\s*年', data.issue_date or '')
+            if m:
+                data.year = m.group(1)
+                data.issue_date = data.issue_date.strip()
+
             return data
         except Exception as e:
             self._logger.error(f"解析失败 {md_path}: {e}")
             return None
+
+    # task 75：业务板块统计时忽略的非板块行标签
+    _SEGMENT_SKIP = {
+        '', '/', '-', '—', '合计', '小计', '总计', '项目', '科目', '业务类型',
+        '业务板块', '业务板块名称', '业务名称', '其中：', '其中', '收入', '占比',
+        '金额', '成本', '毛利润', '毛利率',
+        # 结构性/汇总行（非业务板块）
+        '主营业务', '主营业务收入', '其他业务', '其他业务收入', '营业收入',
+        '营业收入构成情况', '其他', '其它', '其他收入', '其他小计', '其他主营业务',
+    }
+
+    # 行标签前缀：编号（一、/（1）/1.）与"其中："
+    _SEGMENT_PREFIX = re.compile(
+        r'^(?:[（(]?[一二三四五六七八九十百\d]{1,3}[）)]?\s*[、.．]\s*|\d+\s*[、.．]\s*|其中\s*[：:]\s*)+')
+
+    def _clean_segment(self, name: str) -> str:
+        """清洗业务板块行标签：去掉编号前缀/"其中："与结尾冒号"""
+        s = self._SEGMENT_PREFIX.sub('', name or '').strip()
+        s = s.strip('：: 　')
+        return s
+
+    def _parse_segments(self, md_path: str) -> List[str]:
+        """从 04-主营业务分析 笔记的「1、营业收入」表提取业务板块名称（task 75）。
+
+        兼容两种表头：
+        - 单标签列（首列为业务板块，如"租赁业务/光伏供电/…"）
+        - 双标签列（"科目 | 业务类型"，如"主营收入 | 莱赛尔"，取业务类型列）
+        会剔除合计/小计等结构性行，并清理"一、""2.""其中："等编号前缀。
+        """
+        try:
+            with open(md_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+        except Exception:
+            return []
+
+        m = re.search(r'###\s*1、营业收入(.*?)(?:\n###|\n---|\Z)', content, re.DOTALL)
+        if not m:
+            return []
+        rows = [l for l in m.group(1).split('\n') if l.strip().startswith('|')]
+        if len(rows) < 2:
+            return []
+
+        def cells(line: str) -> List[str]:
+            return [c.strip() for c in line.strip().strip('|').split('|')]
+
+        header = cells(rows[0])
+        dual = len(header) > 1 and any(k in header[0] for k in ('科目', '项目')) \
+            and any(k in header[1] for k in ('业务类型', '业务名称', '业务板块'))
+
+        segs: List[str] = []
+        for line in rows[1:]:
+            cs = cells(line)
+            if not cs or not ''.join(cs).strip(' -.') or set(''.join(cs)) <= set('-: |'):
+                continue  # 分隔行
+            if dual and len(cs) > 1 and cs[1]:
+                raw = cs[1]
+            else:
+                raw = cs[0]
+            name = self._clean_segment(raw)
+            if not name or name in self._SEGMENT_SKIP:
+                continue
+            if re.search(r'小计|合计|总计', name):
+                continue
+            if re.fullmatch(r'[\d,\.%\-]+', name):
+                continue
+            if name not in segs:
+                segs.append(name)
+        return segs
+
+    def _bond_month_key(self, issue_date: str) -> str:
+        """task 75：由发行日期得到"YYYY年M月"分组键（月份缺失时标注）"""
+        m = re.match(r'(\d{4})\s*年\s*(\d{1,2})\s*月', issue_date or '')
+        if m:
+            return f"{m.group(1)}年{int(m.group(2))}月"
+        m = re.match(r'(\d{4})\s*年', issue_date or '')
+        if m:
+            return f"{m.group(1)}年（月份未披露）"
+        return '发行日期未知'
+
+    @staticmethod
+    def _month_sort_key(key: str):
+        m = re.match(r'(\d{4})年(?:(\d{1,2})月)?', key)
+        if not m:
+            return (9999, 99, key)
+        return (int(m.group(1)), int(m.group(2)) if m.group(2) else 99, key)
 
     def generate_issuer_index(self, notes: List[NoteInfo]) -> str:
         """生成发行人索引"""
@@ -191,7 +284,7 @@ class MetaIndexGenerator:
                     issuers[issuer]['tags'].add(tag)
 
             # 记录文件
-            rel_path = os.path.relpath(note.file, self.knowledge_dir)
+            rel_path = os.path.relpath(note.file, self.knowledge_dir).replace('\\', '/')
             if note.dir not in issuers[issuer]['files']:
                 issuers[issuer]['files'][note.dir] = rel_path
 
@@ -273,6 +366,33 @@ class MetaIndexGenerator:
                 if bond_info:
                     bonds.append(bond_info)
 
+        # task 75：发行人 → 各类笔记相对路径（用于债券简称链接到 5 类笔记）
+        issuer_files: Dict[str, Dict[str, str]] = {}
+        for note in notes:
+            if not note.issuer:
+                continue
+            rel = os.path.relpath(note.file, self.knowledge_dir).replace('\\', '/')
+            issuer_files.setdefault(note.issuer, {})
+            if note.dir not in issuer_files[note.issuer]:
+                issuer_files[note.issuer][note.dir] = rel
+
+        def note_link(issuer: str, dir_name: str, label: str) -> str:
+            rel = issuer_files.get(issuer, {}).get(dir_name)
+            return f"[{label}](../{rel})" if rel else "—"
+
+        def bond_label(bond: NoteInfo) -> str:
+            """分组列表中的展示名：债券简称缺失时回退为发行人名称"""
+            return bond.bond_short or bond.issuer or '(未命名)'
+
+        # task 75：债券简称 → 主营业务板块（取该发行人 04-主营业务分析 笔记）
+        bond_segments: Dict[str, List[str]] = {}
+        for bond in bonds:
+            rel = issuer_files.get(bond.issuer, {}).get('04-主营业务分析')
+            if rel:
+                segs = self._parse_segments(os.path.join(self.knowledge_dir, rel))
+                if segs:
+                    bond_segments[bond_label(bond)] = segs
+
         # 构建 markdown 内容
         lines = [
             "---",
@@ -297,7 +417,7 @@ class MetaIndexGenerator:
             bond_type = bond.bond_type or '公司债'
             if bond_type not in by_type:
                 by_type[bond_type] = []
-            by_type[bond_type].append(bond.bond_short or '')
+            by_type[bond_type].append(bond_label(bond))
 
         for bond_type in sorted(by_type.keys()):
             bond_list = by_type[bond_type]
@@ -305,26 +425,24 @@ class MetaIndexGenerator:
                 f"| {bond_type} | {len(bond_list)} | {'、'.join(bond_list)} |"
             )
 
-        # 按发行年份统计
+        # task 75：按发行月份统计（原"按发行年份统计"细化到月份）
         lines.extend([
             "",
-            "### 按发行年份统计",
+            "### 按发行月份统计",
             "",
-            "| 年份 | 数量 | 债券简称 |",
-            "|------|------|---------|",
+            "| 发行月份 | 数量 | 债券简称 |",
+            "|---------|------|---------|",
         ])
 
-        by_year: Dict[str, List[str]] = {}
+        by_month: Dict[str, List[str]] = {}
         for bond in bonds:
-            year = bond.year or '未知'
-            if year not in by_year:
-                by_year[year] = []
-            by_year[year].append(bond.bond_short or '')
+            key = self._bond_month_key(bond.issue_date)
+            by_month.setdefault(key, []).append(bond_label(bond))
 
-        for year in sorted(by_year.keys()):
-            bond_list = by_year[year]
+        for key in sorted(by_month.keys(), key=self._month_sort_key):
+            bond_list = by_month[key]
             lines.append(
-                f"| {year}年 | {len(bond_list)} | {'、'.join(bond_list)} |"
+                f"| {key} | {len(bond_list)} | {'、'.join(bond_list)} |"
             )
 
         # 按增信方式统计
@@ -341,7 +459,7 @@ class MetaIndexGenerator:
             guarantee = bond.guarantee or '信用'
             if guarantee not in by_guarantee:
                 by_guarantee[guarantee] = []
-            by_guarantee[guarantee].append(bond.bond_short or '')
+            by_guarantee[guarantee].append(bond_label(bond))
 
         for guarantee in sorted(by_guarantee.keys()):
             bond_list = by_guarantee[guarantee]
@@ -349,23 +467,53 @@ class MetaIndexGenerator:
                 f"| {guarantee} | {len(bond_list)} | {'、'.join(bond_list)} |"
             )
 
-        # 详细索引表
+        # task 75：按主营业务板块统计
+        lines.extend([
+            "",
+            "### 按业务板块统计",
+            "",
+            "> 取自各发行人 04-主营业务分析 笔记「营业收入」表的业务板块行标签。",
+            "",
+            "| 业务板块 | 数量 | 债券简称 |",
+            "|---------|------|---------|",
+        ])
+
+        by_segment: Dict[str, List[str]] = {}
+        for short, segs in bond_segments.items():
+            for seg in segs:
+                by_segment.setdefault(seg, [])
+                if short and short not in by_segment[seg]:
+                    by_segment[seg].append(short)
+
+        for seg in sorted(by_segment.keys(), key=lambda s: (-len(by_segment[s]), s)):
+            bond_list = sorted(by_segment[seg])
+            lines.append(
+                f"| {seg} | {len(bond_list)} | {'、'.join(bond_list)} |"
+            )
+
+        # 详细索引表：债券简称链接到发行条款，并列出 5 类笔记链接
         lines.extend([
             "",
             "## 索引表",
             "",
-            "| 债券简称 | 发行人 | 发行年份 | 发行规模 | 债券期限 | 增信方式 | 主体评级 | 发行条款 |",
-            "|---------|--------|---------|---------|---------|---------|---------|---------|",
+            "> 债券简称链接到该债券的发行条款笔记，其后各列依次链接到 5 类笔记。",
+            "",
+            "| 债券简称 | 发行人 | 发行日期 | 发行规模 | 债券期限 | 增信方式 | 主体评级 | 发行条款 | 概况 | 资金运用 | 主营业务 | 资产结构 |",
+            "|---------|--------|---------|---------|---------|---------|---------|---------|------|---------|---------|---------|",
         ])
 
-        for bond in sorted(bonds, key=lambda x: x.bond_short or ''):
-            rel_path = os.path.relpath(bond.file, self.knowledge_dir)
+        for bond in sorted(bonds, key=bond_label):
+            short_cell = note_link(bond.issuer, '01-发行条款', bond.bond_short or '条款')
             lines.append(
-                f"| {bond.bond_short or '/'} | {bond.issuer or '/'} | "
-                f"{bond.year or '/'} | {bond.issue_scale or '/'} | "
+                f"| {short_cell} | {bond.issuer or '/'} | "
+                f"{bond.issue_date or '/'} | {bond.issue_scale or '/'} | "
                 f"{bond.bond_term or '/'} | {bond.guarantee or '/'} | "
                 f"{bond.credit_rating or '/'} | "
-                f"[条款](../{rel_path}) |"
+                f"{note_link(bond.issuer, '01-发行条款', '发行条款')} | "
+                f"{note_link(bond.issuer, '03-发行人基本情况', '概况')} | "
+                f"{note_link(bond.issuer, '02-募集资金运用', '资金运用')} | "
+                f"{note_link(bond.issuer, '04-主营业务分析', '主营业务')} | "
+                f"{note_link(bond.issuer, '05-资产结构分析', '资产结构')} |"
             )
 
         # 统计摘要
