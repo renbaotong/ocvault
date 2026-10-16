@@ -261,6 +261,25 @@ class MetaIndexGenerator:
             return (9999, 99, key)
         return (int(m.group(1)), int(m.group(2)) if m.group(2) else 99, key)
 
+    @staticmethod
+    def _date_sort_key(issue_date: str):
+        """task 76：索引表按发行日期倒序排序的键（无日期者排最后）。
+
+        返回 (分组, -年, -月, -日)：分组 0 为有日期、1 为无日期；
+        年月日取负值，配合默认升序即"最新发行排最前"。
+        """
+        d = (issue_date or '').strip()
+        m = re.match(r'(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日', d)
+        if m:
+            return (0, -int(m.group(1)), -int(m.group(2)), -int(m.group(3)))
+        m = re.match(r'(\d{4})\s*年\s*(\d{1,2})\s*月', d)
+        if m:
+            return (0, -int(m.group(1)), -int(m.group(2)), 0)
+        m = re.match(r'(\d{4})\s*年', d)
+        if m:
+            return (0, -int(m.group(1)), 0, 0)
+        return (1, 0, 0, 0)
+
     def generate_issuer_index(self, notes: List[NoteInfo]) -> str:
         """生成发行人索引"""
         # 按发行人分组
@@ -496,13 +515,14 @@ class MetaIndexGenerator:
             "",
             "## 索引表",
             "",
-            "> 债券简称链接到该债券的发行条款笔记，其后各列依次链接到 5 类笔记。",
+            "> 索引表按发行日期倒序排列（最新发行在前）；债券简称链接到该债券的发行条款笔记，",
+            "> 其后各列依次链接到 5 类笔记。",
             "",
             "| 债券简称 | 发行人 | 发行日期 | 发行规模 | 债券期限 | 增信方式 | 主体评级 | 发行条款 | 概况 | 资金运用 | 主营业务 | 资产结构 |",
             "|---------|--------|---------|---------|---------|---------|---------|---------|------|---------|---------|---------|",
         ])
 
-        for bond in sorted(bonds, key=bond_label):
+        for bond in sorted(bonds, key=lambda b: (self._date_sort_key(b.issue_date), bond_label(b))):
             short_cell = note_link(bond.issuer, '01-发行条款', bond.bond_short or '条款')
             lines.append(
                 f"| {short_cell} | {bond.issuer or '/'} | "
