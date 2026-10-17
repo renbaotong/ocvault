@@ -1,0 +1,4 @@
+# 文本文件统一以 LF 存储与检出。
+# 本仓库的笔记由 Python 脚本以 LF 写入，而 Windows 默认 core.autocrlf=true
+# 会在检出时转成 CRLF，导致 git status 频繁出现纯行尾差异。
+* text=auto eol=lf

@@ -106,20 +106,21 @@ def main():
 
     print(f"发现 {len(pdf_files)} 份 PDF，开始提取到临时目录...")
 
-    # 临时目录放在项目根目录内（系统 Temp 可能因权限/沙箱限制无法写入）
-    tmp_base = tempfile.mkdtemp(prefix='_kb_verify_', dir=PROJECT_ROOT)
-    # 部分受限环境（沙箱等）禁止向新建目录写入，此时回退到固定的 _tmp_kb
-    probe = os.path.join(tmp_base, '.probe')
-    try:
-        with open(probe, 'w') as fh:
-            fh.write('x')
-        os.remove(probe)
-    except OSError:
-        fallback = os.path.join(PROJECT_ROOT, '_tmp_kb')
-        os.makedirs(fallback, exist_ok=True)
-        # 清空回退目录的旧内容，避免与本次提取结果混淆
-        for entry in os.listdir(fallback):
-            entry_path = os.path.join(fallback, entry)
+    # 临时目录放在项目根目录内（系统 Temp 可能因权限/沙箱限制无法写入）。
+    # 优先用固定路径 _tmp_kb：部分环境下 tempfile.mkdtemp 新建的目录会被沙箱 ACL
+    # 拒绝写入，且失败后清理不掉，每次运行都会残留一个空目录。
+    def _prepare_dir(path: str) -> bool:
+        """创建并清空目录；不可写时返回 False"""
+        try:
+            os.makedirs(path, exist_ok=True)
+            probe = os.path.join(path, '.probe')
+            with open(probe, 'w') as fh:
+                fh.write('x')
+            os.remove(probe)
+        except OSError:
+            return False
+        for entry in os.listdir(path):
+            entry_path = os.path.join(path, entry)
             if os.path.isdir(entry_path):
                 shutil.rmtree(entry_path, ignore_errors=True)
             else:
@@ -127,9 +128,12 @@ def main():
                     os.remove(entry_path)
                 except OSError:
                     pass
-        shutil.rmtree(tmp_base, ignore_errors=True)
-        tmp_base = fallback
-        print(f"新建临时目录不可写，回退到: {tmp_base}")
+        return True
+
+    tmp_base = os.path.join(PROJECT_ROOT, '_tmp_kb')
+    if not _prepare_dir(tmp_base):
+        tmp_base = tempfile.mkdtemp(prefix='_kb_verify_', dir=PROJECT_ROOT)
+        print(f"固定临时目录不可写，回退到: {tmp_base}")
     print(f"临时目录: {tmp_base}")
 
     errors = []
