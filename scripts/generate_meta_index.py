@@ -52,6 +52,8 @@ class NoteInfo:
     dir: str
     # 债券信息（从发行条款笔记中提取）
     bond_short: str = ""
+    # task 77：去重后的展示用简称（重名时追加发行人区分词）
+    display_short: str = ""
     bond_type: str = ""
     year: str = ""
     issue_date: str = ""   # task 75：完整发行日期（YYYY年M月D日）
@@ -280,6 +282,71 @@ class MetaIndexGenerator:
             return (0, -int(m.group(1)), 0, 0)
         return (1, 0, 0, 0)
 
+    @staticmethod
+    def _issuer_suffix(issuer: str, width: int) -> str:
+        """task 77：取发行人名称中用于区分同名债券的部分。
+
+        债券简称形如「山东债 01」（省/市首 2 字 + 债 + 序号），同省市发行人
+        必然重名。这里先去掉开头的行政区划前缀再取 width 个字作为区分词：
+        - 前 4 字内出现「省」「市」时截到该字为止（佛山市南海区… → 南海区…）
+          只在前 4 字内判断，避免「重庆秀城城市运营…」的「城市」被误当行政后缀
+        - 否则按 2 字前缀截断（山东同舟… → 同舟…）
+        结果为「同舟」「福田」「大足」这类可读且通常唯一的片段。
+        """
+        name = (issuer or '').strip()
+        if len(name) <= 2:
+            return name
+
+        prefix_end = 0
+        for i, ch in enumerate(name[:4]):
+            if ch in ('省', '市'):
+                prefix_end = i + 1
+                break
+        if not prefix_end:
+            prefix_end = 2
+
+        suffix = name[prefix_end:prefix_end + width]
+        # 后缀不足或为空时回退为完整名称，确保仍可区分
+        return suffix or name
+
+    def _assign_unique_short_names(self, bonds: List[NoteInfo]) -> None:
+        """task 77：为每只债券计算全局唯一的展示简称。
+
+        - 简称本身不重复：直接使用原简称；
+        - 简称重复：追加发行人区分词，如「山东债 01（同舟）」；
+          区分词长度从 2 字起逐级加长，仍冲突时回退为完整发行人名称。
+        原 frontmatter/正文中的「债券简称」保持不动，仅索引展示用唯一名称。
+        """
+        groups: Dict[str, List[NoteInfo]] = {}
+        for bond in bonds:
+            groups.setdefault(bond.bond_short or '', []).append(bond)
+
+        for short, group in groups.items():
+            if not short:
+                for bond in group:
+                    bond.display_short = bond.issuer or '(未命名)'
+                continue
+
+            if len(group) == 1:
+                group[0].display_short = short
+                continue
+
+            suffixes: List[str] = []
+            width = 2
+            while width <= 12:
+                suffixes = [self._issuer_suffix(b.issuer, width) for b in group]
+                if len(set(suffixes)) == len(suffixes):
+                    break
+                width += 1
+            else:
+                suffixes = [b.issuer or '(未命名)' for b in group]
+
+            for bond, suffix in zip(group, suffixes):
+                if suffix and suffix != (bond.issuer or ''):
+                    bond.display_short = f"{short}（{suffix}）"
+                else:
+                    bond.display_short = suffix or short
+
     def generate_issuer_index(self, notes: List[NoteInfo]) -> str:
         """生成发行人索引"""
         # 按发行人分组
@@ -385,6 +452,9 @@ class MetaIndexGenerator:
                 if bond_info:
                     bonds.append(bond_info)
 
+        # task 77：计算全局唯一展示简称（同名简称追加发行人区分词）
+        self._assign_unique_short_names(bonds)
+
         # task 75：发行人 → 各类笔记相对路径（用于债券简称链接到 5 类笔记）
         issuer_files: Dict[str, Dict[str, str]] = {}
         for note in notes:
@@ -400,8 +470,8 @@ class MetaIndexGenerator:
             return f"[{label}](../{rel})" if rel else "—"
 
         def bond_label(bond: NoteInfo) -> str:
-            """分组列表中的展示名：债券简称缺失时回退为发行人名称"""
-            return bond.bond_short or bond.issuer or '(未命名)'
+            """分组列表中的展示名：优先唯一简称，缺失时回退为发行人名称"""
+            return bond.display_short or bond.bond_short or bond.issuer or '(未命名)'
 
         # task 75：债券简称 → 主营业务板块（取该发行人 04-主营业务分析 笔记）
         bond_segments: Dict[str, List[str]] = {}
@@ -523,7 +593,7 @@ class MetaIndexGenerator:
         ])
 
         for bond in sorted(bonds, key=lambda b: (self._date_sort_key(b.issue_date), bond_label(b))):
-            short_cell = note_link(bond.issuer, '01-发行条款', bond.bond_short or '条款')
+            short_cell = note_link(bond.issuer, '01-发行条款', bond_label(bond))
             lines.append(
                 f"| {short_cell} | {bond.issuer or '/'} | "
                 f"{bond.issue_date or '/'} | {bond.issue_scale or '/'} | "

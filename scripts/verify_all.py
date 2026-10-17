@@ -44,10 +44,46 @@ EXTRACTORS = [
 # 忽略日期字段（created / 提取日期），它们随运行日期变化，不属于提取内容差异
 DATE_RE = re.compile(r'^(created:.*|.*提取日期.*)$', re.M)
 
+# task 77：表格单元格/分隔行的行内空白规范化
+# Obsidian 表格插件（Advanced Tables）保存时会把 `|a|b|` 重排成 `| a | b |`，
+# 并把分隔行 `|---|---|` 补成 `| --- | --- |`。这类重排纯属编辑器格式，
+# 不属于提取内容差异，对比前统一抹平，避免误报。
+TABLE_SEP_CELL_RE = re.compile(r'^:?-{1,}:?$')
+
+
+def _normalize_table_line(line: str) -> str:
+    """把 Markdown 表格行规范为固定的单空格格式。
+
+    - 单元格两侧空白压缩为 1 个空格
+    - 分隔行（全是 --- 的单元格）统一为 `|---|---|`
+    非表格行原样返回。
+    """
+    stripped = line.strip()
+    if not stripped.startswith('|') or not stripped.endswith('|'):
+        return line
+
+    cells = [c.strip() for c in stripped.strip('|').split('|')]
+    if cells and all(TABLE_SEP_CELL_RE.match(c) or not c for c in cells) \
+            and any(TABLE_SEP_CELL_RE.match(c) for c in cells):
+        # 分隔行：统一长短，保留首尾冒号（对齐标记）
+        norm = []
+        for c in cells:
+            if TABLE_SEP_CELL_RE.match(c):
+                left = ':' if c.startswith(':') else ''
+                right = ':' if c.endswith(':') else ''
+                norm.append(f'{left}---{right}')
+            else:
+                norm.append('')
+        return '|' + '|'.join(norm) + '|'
+
+    return '| ' + ' | '.join(cells) + ' |'
+
 
 def normalize(content: bytes) -> str:
-    """规范化：统一行尾 + 抹平日期字段，用于内容对比"""
-    return DATE_RE.sub('__DATE__', content.decode('utf-8').replace('\r\n', '\n'))
+    """规范化：统一行尾 + 抹平日期字段 + 抹平表格行内空白，用于内容对比"""
+    text = content.decode('utf-8').replace('\r\n', '\n')
+    text = DATE_RE.sub('__DATE__', text)
+    return '\n'.join(_normalize_table_line(line) for line in text.split('\n'))
 
 
 def main():
